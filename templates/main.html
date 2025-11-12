@@ -58,7 +58,7 @@
             --link-color: #0366d6;
             --table-header-bg: #f6f8fa;
             --sidebar-width: 250px;
-            --sidebar-collapsed-width: 0px;
+            --sidebar-collapsed-width: 48px;
             --content-max-width: 100%;
             --transition-speed: 0.3s;
             --transition-timing: ease;
@@ -608,6 +608,18 @@
             });
         }
 
+        // Helper function to set sidebar and content dimensions
+        function setSidebarWidth(width) {
+            const sidebar = document.querySelector('.sidebar');
+            const content = document.getElementById('content');
+            if (sidebar && content) {
+                sidebar.style.width = width + 'px';
+                sidebar.style.minWidth = width + 'px';
+                content.style.marginLeft = width + 'px';
+                content.style.width = `calc(100% - ${width}px)`;
+            }
+        }
+
         // Sidebar toggle management
         let isToggling = false;
         function toggleSidebar() {
@@ -620,24 +632,16 @@
             const isCollapsed = document.body.classList.contains('sidebar-collapsed');
 
             if (!isCollapsed) {
-                // Collapsing: save current width and set to 0
+                // Collapsing: save current width and set to collapsed width
                 const currentWidth = sidebar.offsetWidth;
                 localStorage.setItem('sidebarWidthBeforeCollapse', currentWidth.toString());
-
-                sidebar.style.width = '0px';
-                sidebar.style.minWidth = '0px';
-                content.style.marginLeft = '0px';
-                content.style.width = 'calc(100% - 0px)';
+                setSidebarWidth(48);
             } else {
                 // Expanding: restore previous width
                 const savedWidth = localStorage.getItem('sidebarWidthBeforeCollapse') ||
                                    localStorage.getItem('sidebarWidth') || '250';
                 const width = parseInt(savedWidth);
-
-                sidebar.style.width = width + 'px';
-                sidebar.style.minWidth = width + 'px';
-                content.style.marginLeft = width + 'px';
-                content.style.width = `calc(100% - ${width}px)`;
+                setSidebarWidth(width);
             }
 
             document.body.classList.toggle('sidebar-collapsed');
@@ -654,16 +658,7 @@
             const isCollapsed = localStorage.getItem('sidebar-collapsed') === 'true';
             if (isCollapsed) {
                 document.body.classList.add('sidebar-collapsed');
-
-                // Also set inline styles to 0 width
-                const sidebar = document.querySelector('.sidebar');
-                const content = document.getElementById('content');
-                if (sidebar && content) {
-                    sidebar.style.width = '0px';
-                    sidebar.style.minWidth = '0px';
-                    content.style.marginLeft = '0px';
-                    content.style.width = 'calc(100% - 0px)';
-                }
+                setSidebarWidth(48);
             }
         }
 
