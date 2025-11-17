@@ -61,7 +61,7 @@
 - Add install script and update README
 - Add macOS install instructions
 - Add image support
-- Add screenshot of mdserve serving README.md
+- Add screenshot of docserve serving README.md
 - Enable HTML tag rendering in markdown files (#2)
 - Release 0.2.0
 

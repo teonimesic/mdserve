@@ -1,105 +1,101 @@
-# mdserve
+# docserve
 
-Fast markdown preview server with **live reload** and **theme support**.
+Fast markdown documentation server with **live reload**, **recursive folder support**, and **theme switching**.
 
-Just run `mdserve file.md` and start writing. One statically-compiled executable that runs anywhere - no installation, no dependencies.
+> **Note**: This project is based on [mdserve](https://github.com/some-natalie/mdserve) but has evolved significantly with a complete React frontend rewrite, recursive folder watching, and enhanced UI features.
 
-![Terminal output when starting mdserve](mdserve-terminal-output.png)
+Just run `docserve docs/` and start writing. One statically-compiled executable with embedded React SPA - no installation, no dependencies.
 
 ## Features
 
-- ⚡ **Instant Live Reload** - Real-time updates via WebSocket when markdown file changes
-- 📁 **Directory Mode** - Serve all markdown files in a directory with a navigation sidebar
-- 🎨 **Multiple Themes** - Built-in theme selector with 5 themes including Catppuccin variants
+- ⚡ **Instant Live Reload** - Real-time updates via WebSocket when markdown files change
+- 📁 **Recursive Folder Support** - Automatically watches all subdirectories and nested markdown files
+- 🌲 **Collapsible File Tree** - Navigate nested documentation with an interactive sidebar
+- 🎨 **5 Built-in Themes** - Light, Dark, and Catppuccin variants with localStorage persistence
 - 📝 **GitHub Flavored Markdown** - Full GFM support including tables, strikethrough, code blocks, and task lists
 - 📊 **Mermaid Diagrams** - Automatic rendering of flowcharts, sequence diagrams, class diagrams, and more
-- 🚀 **Fast** - Built with Rust and Axum for excellent performance and low memory usage
+- 🔗 **Smart Link Navigation** - Relative markdown links work seamlessly without page reloads
+- 🖱️ **Resizable Sidebar** - Drag to resize or collapse the sidebar to your preference
+- ✅ **Interactive Checkboxes** - Check/uncheck task list items directly in the UI (saves to file)
+- 🚀 **Fast & Lightweight** - Rust backend + React SPA with client-side markdown rendering
+
+## Architecture
+
+**Backend**: Rust (Axum) - HTTP server, WebSocket live reload, recursive file watching
+
+**Frontend**: React SPA (TypeScript) - Client-side markdown parsing with marked.js, theme management, interactive file tree
+
+**Build**: Single binary with embedded frontend assets (~2MB) via rust-embed
+
+See [Architecture Documentation](docs/architecture.md) for detailed information.
 
 ## Installation
 
-### macOS (Homebrew)
+### From npm (Recommended)
 
 ```bash
-brew install mdserve
+npm install -g docserve
 ```
 
-### Linux
+### Using Cargo
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/jfernandez/mdserve/main/install.sh | bash
+cargo install docserve
 ```
 
-This will automatically detect your platform and install the latest binary to your system.
-
-### Alternative Methods
-
-#### Using Cargo
+### From Source
 
 ```bash
-cargo install mdserve
-```
-
-#### Arch Linux
-
-```bash
-sudo pacman -S mdserve
-```
-
-#### Nix Package Manager
-
-``` bash
-nix profile install github:jfernandez/mdserve
-```
-
-#### From Source
-
-```bash
-git clone https://github.com/jfernandez/mdserve.git
-cd mdserve
+git clone https://github.com/teonimesic/docserve.git
+cd docserve
+cd frontend && npm install && npm run build && cd ..
 cargo build --release
-cp target/release/mdserve <folder in your PATH>
+cp target/release/docserve <folder in your PATH>
 ```
 
-#### Manual Download
+### Manual Download
 
-Download the appropriate binary for your platform from the [latest release](https://github.com/jfernandez/mdserve/releases/latest).
+Download the appropriate binary for your platform from the [latest release](https://github.com/teonimesic/docserve/releases/latest).
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-# Serve a single markdown file on default port (3000)
-mdserve README.md
-
-# Serve all markdown files in a directory
-mdserve docs/
+# Serve all markdown files in a directory (recursive)
+docserve docs/
 
 # Serve on custom port
-mdserve README.md --port 8080
-mdserve docs/ -p 8080
+docserve docs/ --port 8080
+docserve docs/ -p 8080
 
 # Serve on custom hostname and port
-mdserve README.md --hostname 0.0.0.0 --port 8080
+docserve docs/ --hostname 0.0.0.0 --port 8080
 ```
 
-### Single-File vs Directory Mode
+### Directory Mode
 
-**Single-File Mode**: When you pass a file path, mdserve serves that specific markdown file with a clean, focused view.
+When you pass a directory path, docserve automatically:
+- Scans and serves all `.md` and `.markdown` files **recursively** in subdirectories
+- Displays an interactive navigation sidebar with collapsible folders
+- Watches for file changes, additions, and deletions in real-time
+- Preserves folder expansion state and sidebar preferences in localStorage
 
-**Directory Mode**: When you pass a directory path, mdserve automatically:
-- Scans and serves all `.md` and `.markdown` files in that directory
-- Displays a navigation sidebar for easy switching between files
-- Watches for new markdown files added to the directory
-- Only monitors the immediate directory (non-recursive)
+**Note**: Single-file mode is not currently supported. Place your markdown file in a directory to serve it.
 
-
-## Endpoints
+## API Endpoints
 
 Once running, the server provides (default: [http://localhost:3000](http://localhost:3000)):
 
-- **[`/`](http://localhost:3000/)** - Rendered HTML with live reload via WebSocket
-- **[`/ws`](http://localhost:3000/ws)** - WebSocket endpoint for real-time updates
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Serve React SPA |
+| GET | `/api/files` | List all markdown files (recursive) |
+| GET | `/api/files/{path}` | Get markdown file content |
+| PUT | `/api/files/{path}` | Update file content (checkbox editing) |
+| GET | `/api/static/{path}` | Serve static files (images, etc.) |
+| GET | `/ws` | WebSocket connection for live reload |
+| GET | `/__health` | Health check endpoint |
 
 ## Theme System
 
@@ -110,20 +106,8 @@ Once running, the server provides (default: [http://localhost:3000](http://local
   - **Dark**: GitHub-inspired dark theme with comfortable contrast
   - **Catppuccin Latte**: Warm light theme with soothing pastels
   - **Catppuccin Macchiato**: Cozy mid-tone theme with rich colors
-  - **Catppuccin Mocha**: Deep dark theme with vibrant accents
+  - **Catppuccin Mocha**: Deep dark theme with vibrant accents (default)
 - **Persistent Preference**: Your theme choice is automatically saved in browser localStorage
-
-*Click the theme button (🎨) to access the built-in theme selector*
-
-![Theme picker interface](mdserve-theme-picker.png)
-
-*mdserve running with the Catppuccin Macchiato theme - notice the warm, cozy colors and excellent readability*
-
-![mdserve with Catppuccin Macchiato theme](mdserve-catppuccin-macchiato.png)
-
-## Documentation
-
-For detailed information about mdserve's internal architecture, design decisions, and how it works under the hood, see [Architecture Documentation](docs/architecture.md).
 
 ## Development
 
@@ -135,18 +119,22 @@ For detailed information about mdserve's internal architecture, design decisions
 ### Building
 
 ```bash
-# Build the Rust backend
-cargo build --release
-
-# Build the frontend (React + TypeScript)
+# Build frontend first (outputs to frontend/dist)
 cd frontend
 npm install
 npm run build
+cd ..
+
+# Build Rust binary (embeds frontend/dist)
+cargo build --release
+
+# Run the binary
+./target/release/docserve test_folders/
 ```
 
 ### Running Tests
 
-#### Backend Tests
+#### Backend Tests (Rust)
 
 ```bash
 # Run all Rust tests
@@ -154,7 +142,12 @@ cargo test
 
 # Run integration tests only
 cargo test --test integration_test
+
+# Run with coverage (requires llvm-cov)
+cargo llvm-cov --html
 ```
+
+**Coverage**: Backend maintains **>90% test coverage** with comprehensive integration tests.
 
 #### Frontend Tests
 
@@ -172,19 +165,37 @@ npm run test:coverage
 npm run test:e2e
 ```
 
-**Test Coverage**: The frontend maintains **88.17% overall coverage** with comprehensive test suites for:
+**Coverage**: Frontend maintains **>88% overall coverage** with:
 - React hooks (100% coverage)
 - UI components (99.44% coverage)
-- Utilities and markdown rendering
-- End-to-end user workflows
+- 17 comprehensive E2E tests (Playwright)
+
+## Differences from Original mdserve
+
+| Feature | Original mdserve | docserve |
+|---------|------------------|----------|
+| Frontend | Server-side Jinja2 templates | React SPA |
+| Markdown Rendering | Server-side (pulldown-cmark) | Client-side (marked.js) |
+| Folder Support | Flat only | Recursive with nested folders |
+| Single File Mode | Supported | Not currently supported |
+| File Caching | In-memory HTML cache | No caching (read on demand) |
+| Navigation | Server-generated links | Client-side SPA routing |
+| Theme Persistence | None | localStorage with 5 themes |
+| Binary Size | ~500KB | ~2MB (includes React) |
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## Maintainer
+
+**Stefano Benatti** - [teonimesic](https://github.com/teonimesic)
+
 ## Acknowledgments
 
+- Based on [mdserve](https://github.com/some-natalie/mdserve) by @some-natalie
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
-- Markdown parsing by [markdown-rs](https://github.com/wooorm/markdown-rs)
+- React frontend with [Vite](https://vitejs.dev/) build tool
+- Markdown parsing by [marked.js](https://marked.js.org/)
+- Diagram rendering by [Mermaid.js](https://mermaid.js.org/)
 - [Catppuccin](https://catppuccin.com/) color themes
-- Inspired by various markdown preview tools

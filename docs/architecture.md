@@ -1,149 +1,328 @@
-# mdserve Architecture
+# docserve Architecture
+
+> **Note**: This project is based on [mdserve](https://github.com/some-natalie/mdserve) but has evolved significantly with a complete React frontend rewrite and recursive folder support.
 
 ## Overview
 
-mdserve is a simple HTTP server for markdown preview with live reload. It supports both single-file and directory modes with a unified codebase.
+docserve is a modern markdown documentation server with live reload, featuring a React-based single-page application for the frontend and a Rust backend for file serving and WebSocket communication.
 
-**Core principle**: Always work with a base directory and a list of tracked files (1 or more).
-
-```mermaid
-graph LR
-    A[File System] -->|notify events| B[File Watcher]
-    B -->|update state| C[MarkdownState]
-    B -->|broadcast| D[WebSocket]
-    E[HTTP Request] -->|lookup| C
-    C -->|render| F[Template]
-    F -->|HTML| G[Browser]
-    D -->|reload signal| G
-```
-
-## Modes
-
-### Single-File Mode
-```bash
-mdserve README.md
-```
-- Watches parent directory
-- Tracks single file
-- No navigation sidebar
-
-### Directory Mode
-```bash
-mdserve ./docs/
-```
-- Watches specified directory
-- Tracks all `.md` and `.markdown` files
-- Shows navigation sidebar
-
-## Architecture
-
-### State Management
-
-Central state stores:
-- Base directory path
-- HashMap of tracked files (filename → metadata + pre-rendered HTML)
-- Directory mode flag (determines UI)
-- WebSocket broadcast channel
+**Core Architecture**: React SPA + Rust API Server + WebSocket Live Reload
 
 ```mermaid
-classDiagram
-    class MarkdownState {
-        +PathBuf base_dir
-        +HashMap~String,TrackedFile~ tracked_files
-        +bool is_directory_mode
-        +Sender~ServerMessage~ change_tx
-    }
-
-    class TrackedFile {
-        +PathBuf path
-        +SystemTime last_modified
-        +String html
-    }
-
-    MarkdownState "1" --> "*" TrackedFile : contains
+graph TB
+    A[File System] -->|notify events| B[Rust Backend]
+    B -->|WebSocket| C[React Frontend]
+    C -->|HTTP API| B
+    C -->|Render| D[marked.js]
+    D -->|HTML| E[Browser DOM]
+    C -->|Diagrams| F[Mermaid.js]
+    F -->|SVG| E
+    B -->|Static Files| E
 ```
 
-Mode is determined by user intent, not file count:
-- `mdserve /docs/` with 1 file shows sidebar
-- `mdserve single.md` never shows sidebar
+## Architecture Components
 
-**Example states:**
+### Backend (Rust)
 
-Single-file mode:
-```
-base_dir = /path/to/docs/
-tracked_files = {
-  "README.md": TrackedFile { ... }
-}
-is_directory_mode = false
-```
+**Purpose**: Lightweight HTTP/WebSocket server with file watching
 
-Directory mode:
-```
-base_dir = /path/to/docs/
-tracked_files = {
-  "api.md": TrackedFile { ... },
-  "guide.md": TrackedFile { ... },
-  "README.md": TrackedFile { ... }
-}
-is_directory_mode = true
+**Responsibilities**:
+- Serve embedded React SPA (`frontend/dist`)
+- Provide REST API for file listing and content
+- Watch file system for changes (recursive)
+- Broadcast file change events via WebSocket
+- Serve static assets (images, etc.)
+
+**Technology Stack**:
+- `axum` - HTTP server framework
+- `notify` - File system watching (recursive mode)
+- `tokio` - Async runtime
+- `serde` - JSON serialization
+- `rust-embed` - Embed frontend assets at compile time
+
+### Frontend (React SPA)
+
+**Purpose**: Rich interactive UI for browsing and viewing markdown
+
+**Responsibilities**:
+- Render file tree with collapsible folders
+- Parse markdown to HTML client-side
+- Handle relative markdown links
+- Theme management and persistence
+- Sidebar resize and collapse
+- Real-time reload on file changes
+
+**Technology Stack**:
+- React 18 with TypeScript
+- `marked` - Markdown parsing
+- `mermaid` - Diagram rendering
+- Vite - Build tool
+- Vitest - Unit testing
+- Playwright - E2E testing
+
+## Data Flow
+
+### Initial Load
+```mermaid
+sequenceDiagram
+    Browser->>Backend: GET /
+    Backend->>Browser: React SPA (HTML/JS/CSS)
+    Browser->>Backend: GET /api/files
+    Backend->>Browser: File tree JSON
+    Browser->>Backend: GET /api/files/README.md
+    Backend->>Browser: Markdown content JSON
+    Browser->>Browser: marked.parse() → HTML
+    Browser->>Browser: Render to DOM
 ```
 
 ### Live Reload
+```mermaid
+sequenceDiagram
+    FileSystem->>Backend: File changed
+    Backend->>Backend: Detect with notify
+    Backend->>Frontend: WebSocket: FileAdded/Removed/Renamed/Reload
+    Frontend->>Backend: GET /api/files (if structure changed)
+    Frontend->>Backend: GET /api/files/{path} (reload content)
+    Frontend->>Frontend: Re-render UI
+```
 
-Uses [notify](https://github.com/notify-rs/notify) crate to watch base directory (non-recursive):
-- Create/modify: Refresh file, add if new (directory mode only)
-- Delete: Remove from tracking
-- Rename: Remove old, add new
-- All changes trigger WebSocket reload broadcast
+## Key Features
 
-File changes flow:
-1. File system event detected by `notify`
-2. Markdown re-rendered to HTML
-3. State updated (refresh/add/remove tracked file)
-4. `ServerMessage::Reload` broadcast via WebSocket channel
-5. All connected clients receive reload message
-6. Clients execute `window.location.reload()`
+### Recursive Folder Support
 
-### Routing
+Unlike the original mdserve (flat directories only), docserve watches directories recursively:
 
-Single unified router handles both modes:
-- `GET /` → First file alphabetically
-- `GET /:filename.md` → Specific markdown file
-- `GET /:filename.<ext>` → Images from base directory
-- `GET /ws` → WebSocket connection
-- `GET /mermaid.min.js` → Bundled Mermaid library
+```rust
+notify::Config::default()
+    .with_poll_interval(Duration::from_millis(100))
+// Watches all subdirectories automatically
+```
 
-The `:filename` pattern rejects paths with `/`, preventing directory traversal.
+File tree structure:
+```json
+{
+  "files": [
+    {"name": "README.md", "path": "README.md", "is_directory": false},
+    {"name": "docs", "path": "docs", "is_directory": true},
+    {"name": "api.md", "path": "docs/api.md", "is_directory": false}
+  ]
+}
+```
 
-### Rendering
+### Client-Side Rendering
 
-Uses [MiniJinja](https://github.com/mitsuhiko/minijinja) (Jinja2 template syntax) with templates embedded at compile time via [minijinja_embed](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-embed).
+Markdown is parsed in the browser using marked.js:
+- No server-side HTML generation
+- Faster backend (just serves raw markdown)
+- Enables client-side features (theme without reload, etc.)
+- Smaller binary size
 
-Conditional template rendering:
-- Directory mode: Includes navigation sidebar with active file highlighting
-- Single-file mode: Content only
-- Both use same pre-rendered HTML from state
+### Relative Link Navigation
 
-Template variables:
-- `content`: Pre-rendered markdown HTML
-- `mermaid_enabled`: Boolean flag, conditionally includes Mermaid.js when diagrams detected
-- `show_navigation`: Controls sidebar visibility
-- `files`: List of tracked files (directory mode)
-- `current_file`: Active file name (directory mode)
+Markdown links like `[API Docs](../api/overview.md)` are intercepted and resolved client-side:
+
+```typescript
+// frontend/src/components/MarkdownContent.tsx
+const resolvedPath = resolvePath(currentFilePath, linkHref)
+onLinkClick(resolvedPath) // Navigate without full page reload
+```
+
+### WebSocket Messages
+
+Backend → Frontend messages:
+
+```rust
+pub enum ServerMessage {
+    Reload,           // File content changed
+    FileAdded { name: String },
+    FileRemoved { name: String },
+    FileRenamed { old_name: String, new_name: String },
+}
+```
+
+Frontend → Backend messages:
+
+```rust
+pub enum ClientMessage {
+    Ping,              // Keep-alive
+    RequestRefresh,    // Request file list refresh
+    Close,             // Clean disconnect
+}
+```
+
+### Theme System
+
+5 built-in themes with localStorage persistence:
+- Light
+- Dark
+- Catppuccin Latte
+- Catppuccin Macchiato
+- Catppuccin Mocha (default)
+
+Theme applied via CSS custom properties on `<html data-theme="...">`.
+
+### Static File Serving
+
+Images and assets served via `/api/static/{path}`:
+
+```rust
+// Security: Path traversal protection
+let canonical = canonical_path.canonicalize()?;
+if !canonical.starts_with(&base_dir_canonical) {
+    return Err(StatusCode::FORBIDDEN);
+}
+```
+
+Markdown images automatically rewritten:
+```html
+<!-- Markdown: ![logo](assets/logo.png) -->
+<!-- HTML: <img src="/api/static/assets/logo.png"> -->
+```
+
+## API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Serve React SPA |
+| GET | `/api/files` | List all markdown files (recursive) |
+| GET | `/api/files/{path}` | Get markdown file content |
+| PUT | `/api/files/{path}` | Update file content (checkbox editing) |
+| GET | `/api/static/{path}` | Serve static files (images, etc.) |
+| GET | `/ws` | WebSocket connection for live reload |
+| GET | `/__health` | Health check endpoint |
+
+## State Management
+
+### Backend State
+
+No in-memory file caching:
+- Files read from disk on each request
+- Stateless API design
+- Only WebSocket connections are stateful
+
+### Frontend State
+
+React state management:
+- File list (`useState<ApiFile[]>`)
+- Current file path (`useState<string>`)
+- Markdown HTML (`useState<string>`)
+- Theme (`useState<Theme>` + localStorage)
+- Folder expand/collapse (`useState<Record<string, boolean>>` + localStorage)
+- Sidebar width/collapse (`useState<number/boolean>` + localStorage)
+
+## Testing Strategy
+
+### Unit Tests (Frontend)
+
+```bash
+cd frontend && npm test
+```
+
+- Component tests (React Testing Library)
+- Hook tests
+- Utility function tests
+- Coverage target: >90%
+
+### Integration Tests (Rust)
+
+```bash
+cargo test
+```
+
+- API endpoint tests
+- WebSocket message tests
+- File event handler tests
+- Coverage target: >90%
+
+### E2E Tests (Playwright)
+
+```bash
+cd frontend && npm run test:e2e
+```
+
+- Full browser automation
+- File operations, live reload, theme switching
+- Sidebar interactions, mermaid diagrams
+- 17 comprehensive tests
+
+## Build & Deployment
+
+### Development
+
+```bash
+# Terminal 1: Frontend dev server
+cd frontend && npm run dev
+
+# Terminal 2: Rust backend
+cargo run -- test_folders/
+```
+
+### Production Build
+
+```bash
+# Build frontend (outputs to frontend/dist)
+cd frontend && npm run build
+
+# Build Rust binary (embeds frontend/dist)
+cargo build --release
+
+# Single binary contains everything
+./target/release/docserve ./docs/
+```
+
+The frontend is embedded in the Rust binary at compile time using `rust-embed`, resulting in a single portable executable.
 
 ## Design Decisions
 
-**Unified architecture**: Single code path handles both single-file and directory modes. Mode determined by user intent, not file count.
+**React SPA over server-side templates**: Enables rich client-side interactions, theme switching without reload, and better separation of concerns.
 
-**Pre-rendered caching**: All tracked files rendered to HTML in memory on startup and file change. Serving always from memory, never from disk.
+**Client-side markdown rendering**: Reduces server complexity, enables client-side link handling, and improves performance (no HTML generation on server).
 
-**Non-recursive watching**: Only immediate directory, no subdirectories. Simplifies security and state management.
+**Recursive watching**: Modern documentation often has nested folder structures. Recursive watching provides better UX.
 
-**Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript minimal (theme management, reload execution).
+**WebSocket for live reload**: Bidirectional communication enables instant updates and connection status tracking.
 
-## Constraints
+**Embedded frontend**: Single binary deployment is simpler than serving separate frontend files.
 
-- Non-recursive (flat directories only)
-- Alphabetical file ordering only
-- All files pre-rendered in memory
+**localStorage for UI preferences**: Persist theme, folder state, sidebar width across sessions without backend complexity.
+
+## Differences from Original mdserve
+
+| Feature | Original mdserve | docserve |
+|---------|------------------|----------|
+| Frontend | Server-side Jinja2 templates | React SPA |
+| Markdown | Server-side (pulldown-cmark) | Client-side (marked.js) |
+| Folder Support | Flat only | Recursive |
+| Single File Mode | Supported | Not currently supported |
+| File Caching | In-memory HTML cache | No caching (read on demand) |
+| Binary Size | Smaller | Larger (includes React) |
+| Theme Support | Basic | 5 themes with persistence |
+| Navigation | Server-generated links | Client-side routing |
+| Link Handling | Full page reload | SPA navigation |
+
+## Performance Considerations
+
+**Embedded Assets**: ~2MB binary (vs ~500KB for original) due to embedded React app.
+
+**No File Caching**: Backend reads markdown from disk on each request. For documentation sites (typically <100 files, <1MB each), this is fast enough and simplifies the implementation.
+
+**WebSocket Overhead**: Minimal. One WebSocket connection per browser tab.
+
+**Markdown Parsing**: Client-side parsing with marked.js is fast (<10ms for typical markdown files).
+
+## Security
+
+- **Path Traversal Protection**: All file paths canonicalized and validated against base directory
+- **No Code Execution**: Markdown rendered to HTML only (no eval, no templates)
+- **CORS**: Not configured (single-origin application)
+- **WebSocket**: No authentication (designed for local/trusted network use)
+
+## Future Considerations
+
+- Single file mode support (like original mdserve)
+- Full-text search across all markdown files
+- Dark mode auto-detection (prefers-color-scheme)
+- Markdown edit mode with save functionality
+- Custom theme creation
+- PDF export
+- Table of contents generation

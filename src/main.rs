@@ -2,11 +2,11 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-use mdserve::{scan_markdown_files, serve_markdown};
+use docserve::{scan_markdown_files, serve_markdown};
 
 #[derive(Parser)]
-#[command(name = "mdserve")]
-#[command(about = "A simple HTTP server for markdown preview")]
+#[command(name = "docserve")]
+#[command(about = "Fast markdown documentation server with live reload")]
 #[command(version)]
 struct Args {
     /// Path to markdown file or directory to serve

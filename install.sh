@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# mdserve installer script
-# Usage: curl -sSfL https://raw.githubusercontent.com/jfernandez/mdserve/main/install.sh | bash
+# docserve installer script
+# Usage: curl -sSfL https://raw.githubusercontent.com/jfernandez/docserve/main/install.sh | bash
 
 # Repository information
 REPO_OWNER="jfernandez"
-REPO_NAME="mdserve"
-BINARY_NAME="mdserve"
+REPO_NAME="docserve"
+BINARY_NAME="docserve"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -94,7 +94,7 @@ detect_platform() {
     # Normalize OS
     case "$os" in
         Linux*) os="linux" ;;
-        Darwin*) fatal "macOS is not supported by this installer. Please install using Homebrew: brew install mdserve" ;;
+        Darwin*) fatal "macOS is not supported by this installer. Please install using Homebrew: brew install docserve" ;;
         CYGWIN*|MINGW*|MSYS*) fatal "Windows is not currently supported" ;;
         *) fatal "Unsupported operating system: $os" ;;
     esac
@@ -143,7 +143,7 @@ find_install_dir() {
     fi
 
     # Final fallback
-    local fallback_dir="$HOME/.mdserve/bin"
+    local fallback_dir="$HOME/.docserve/bin"
     mkdir -p "$fallback_dir"
     echo "$fallback_dir"
 }
@@ -158,7 +158,7 @@ is_in_path() {
 }
 
 # Main installation function
-install_mdserve() {
+install_docserve() {
     info "Installing $BINARY_NAME..."
 
     # Detect platform
@@ -245,7 +245,7 @@ main() {
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
-                echo "mdserve installer"
+                echo "docserve installer"
                 echo ""
                 echo "Usage: $0 [options]"
                 echo ""
@@ -263,7 +263,7 @@ main() {
         esac
     done
 
-    install_mdserve
+    install_docserve
 }
 
 # Run main function with all arguments
