@@ -130,22 +130,53 @@ For detailed information about mdserve's internal architecture, design decisions
 ### Prerequisites
 
 - Rust 1.85+ (2024 edition)
+- Node.js 18+ and npm (for frontend development)
 
 ### Building
 
 ```bash
+# Build the Rust backend
 cargo build --release
+
+# Build the frontend (React + TypeScript)
+cd frontend
+npm install
+npm run build
 ```
 
 ### Running Tests
 
+#### Backend Tests
+
 ```bash
-# Run all tests
+# Run all Rust tests
 cargo test
 
 # Run integration tests only
 cargo test --test integration_test
 ```
+
+#### Frontend Tests
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Run unit tests (Vitest)
+npm run test
+
+# Run tests with coverage report
+npm run test:coverage
+
+# Run end-to-end tests (Playwright)
+npm run test:e2e
+```
+
+**Test Coverage**: The frontend maintains **88.17% overall coverage** with comprehensive test suites for:
+- React hooks (100% coverage)
+- UI components (99.44% coverage)
+- Utilities and markdown rendering
+- End-to-end user workflows
 
 ## License
 

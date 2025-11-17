@@ -4,43 +4,33 @@ use axum::{
         ws::{Message, WebSocket},
         Path as AxumPath, State, WebSocketUpgrade,
     },
-    http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
-    routing::get,
+    http::{header, StatusCode},
+    response::{IntoResponse, Json},
+    routing::{get, put},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use minijinja::{context, value::Value, Environment};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     net::Ipv6Addr,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::SystemTime,
 };
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, Mutex},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 
-const TEMPLATE_NAME: &str = "main.html";
 const RESCAN_DELAY_MS: u64 = 200;
-static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
-const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
-const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 
 type SharedMarkdownState = Arc<Mutex<MarkdownState>>;
-
-fn template_env() -> &'static Environment<'static> {
-    TEMPLATE_ENV.get_or_init(|| {
-        let mut env = Environment::new();
-        minijinja_embed::load_templates!(&mut env);
-        env
-    })
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -54,11 +44,30 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Reload,
     Pong,
+    FileAdded { name: String },
     FileRenamed { old_name: String, new_name: String },
     FileRemoved { name: String },
 }
 
-use std::collections::HashMap;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ApiFile {
+    path: String,
+}
+
+#[derive(Serialize, Debug)]
+struct FilesResponse {
+    files: Vec<ApiFile>,
+}
+
+#[derive(Serialize, Debug)]
+struct FileContentResponse {
+    markdown: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct FileUpdateRequest {
+    markdown: String,
+}
 
 pub fn scan_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut md_files = Vec::new();
@@ -75,7 +84,6 @@ fn scan_markdown_files_recursive(dir: &Path, md_files: &mut Vec<PathBuf>) -> Res
         if path.is_file() && is_markdown_file(&path) {
             md_files.push(path);
         } else if path.is_dir() {
-            // Recursively scan subdirectories
             scan_markdown_files_recursive(&path, md_files)?;
         }
     }
@@ -90,7 +98,6 @@ fn is_markdown_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Calculate relative path from base_dir, canonicalizing for consistency
 fn calculate_relative_path(file_path: &Path, base_dir: &Path) -> Result<String> {
     let canonical_path = file_path.canonicalize()?;
     let relative_path = canonical_path
@@ -101,36 +108,16 @@ fn calculate_relative_path(file_path: &Path, base_dir: &Path) -> Result<String> 
     Ok(relative_path)
 }
 
-/// Compare two FileTreeNode items for sorting: folders first, then files, both alphabetically
-fn compare_tree_nodes(a: &FileTreeNode, b: &FileTreeNode) -> std::cmp::Ordering {
-    match (a.is_folder, b.is_folder) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.cmp(&b.name),
-    }
-}
-
 struct TrackedFile {
     path: PathBuf,
-    #[allow(dead_code)]  // Will be used for folder removal and root route handling
-    relative_path: String,  // Path relative to base_dir (e.g., "folder/file.md")
     last_modified: SystemTime,
-    html: String,
+    markdown: String,
     content_hash: md5::Digest,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct FileTreeNode {
-    name: String,           // Display name (e.g., "intro.md" or "docs")
-    path: String,           // Relative path (e.g., "docs/intro.md" or "docs")
-    is_folder: bool,        // true if this is a folder, false if file
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    children: Vec<FileTreeNode>,  // Child nodes (files and subfolders)
 }
 
 struct MarkdownState {
     base_dir: PathBuf,
-    tracked_files: HashMap<String, TrackedFile>,
+    tracked_files: std::collections::HashMap<String, TrackedFile>,
     is_directory_mode: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
@@ -139,12 +126,11 @@ impl MarkdownState {
     fn new(base_dir: PathBuf, file_paths: Vec<PathBuf>, is_directory_mode: bool) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
-        let mut tracked_files = HashMap::new();
+        let mut tracked_files = std::collections::HashMap::new();
         for file_path in file_paths {
             let metadata = fs::metadata(&file_path)?;
             let last_modified = metadata.modified()?;
             let content = fs::read_to_string(&file_path)?;
-            let html = Self::markdown_to_html(&content)?;
             let content_hash = md5::compute(&content);
             let relative_path = calculate_relative_path(&file_path, &base_dir)?;
 
@@ -152,9 +138,8 @@ impl MarkdownState {
                 relative_path.clone(),
                 TrackedFile {
                     path: file_path,
-                    relative_path,
                     last_modified,
-                    html,
+                    markdown: content,
                     content_hash,
                 },
             );
@@ -168,120 +153,10 @@ impl MarkdownState {
         })
     }
 
-    fn show_navigation(&self) -> bool {
-        self.is_directory_mode
-    }
-
     fn get_sorted_filenames(&self) -> Vec<String> {
         let mut filenames: Vec<_> = self.tracked_files.keys().cloned().collect();
         filenames.sort();
         filenames
-    }
-
-    fn get_file_tree(&self) -> Vec<FileTreeNode> {
-        use std::collections::BTreeMap;
-
-        // Get all file paths sorted
-        let filenames = self.get_sorted_filenames();
-
-        // Build tree structure using a nested map approach
-        let mut root_files = Vec::new();
-        let mut folders: BTreeMap<String, Vec<FileTreeNode>> = BTreeMap::new();
-
-        for file_path in filenames {
-            // Normalize path separators to forward slash for consistency
-            let normalized_path = file_path.replace('\\', "/");
-            let parts: Vec<&str> = normalized_path.split('/').collect();
-
-            if parts.len() == 1 {
-                // Root level file
-                root_files.push(FileTreeNode {
-                    name: parts[0].to_string(),
-                    path: normalized_path.clone(),
-                    is_folder: false,
-                    children: Vec::new(),
-                });
-            } else {
-                // File in a folder - build folder path incrementally
-                for i in 0..parts.len() - 1 {
-                    let folder_parts = &parts[0..=i];
-                    let folder_path = folder_parts.join("/");
-
-                    // Ensure this folder exists in our map
-                    folders.entry(folder_path.clone()).or_default();
-                }
-
-                // Add file to its parent folder
-                let parent_folder = parts[0..parts.len() - 1].join("/");
-                let file_node = FileTreeNode {
-                    name: parts[parts.len() - 1].to_string(),
-                    path: normalized_path,
-                    is_folder: false,
-                    children: Vec::new(),
-                };
-
-                folders
-                    .get_mut(&parent_folder)
-                    .unwrap()
-                    .push(file_node);
-            }
-        }
-
-        // Build folder tree recursively
-        fn build_folder_nodes(
-            folder_path: &str,
-            folders: &BTreeMap<String, Vec<FileTreeNode>>,
-        ) -> FileTreeNode {
-            let name = folder_path.split('/').next_back().unwrap_or(folder_path).to_string();
-            let mut children = Vec::new();
-
-            // Add files in this folder
-            if let Some(files) = folders.get(folder_path) {
-                children.extend(files.clone());
-            }
-
-            // Add subfolders
-            let folder_prefix = format!("{}/", folder_path);
-            for (sub_folder_path, _) in folders.iter() {
-                if sub_folder_path.starts_with(&folder_prefix) {
-                    // Check if this is a direct child (not a deeper descendant)
-                    let remaining = &sub_folder_path[folder_prefix.len()..];
-                    if !remaining.contains('/') {
-                        let subfolder_node = build_folder_nodes(sub_folder_path, folders);
-                        children.push(subfolder_node);
-                    }
-                }
-            }
-
-            // Sort children: folders first, then files, both alphabetically
-            children.sort_by(compare_tree_nodes);
-
-            FileTreeNode {
-                name,
-                path: folder_path.to_string(),
-                is_folder: true,
-                children,
-            }
-        }
-
-        // Build root-level folder nodes
-        let mut result = Vec::new();
-
-        // Add root-level folders
-        for (folder_path, _) in folders.iter() {
-            // Only process top-level folders (no '/' in path)
-            if !folder_path.contains('/') {
-                result.push(build_folder_nodes(folder_path, &folders));
-            }
-        }
-
-        // Add root-level files
-        result.extend(root_files);
-
-        // Sort result: folders first, then files, both alphabetically
-        result.sort_by(compare_tree_nodes);
-
-        result
     }
 
     fn refresh_file(&mut self, relative_path: &str) -> Result<()> {
@@ -291,9 +166,23 @@ impl MarkdownState {
 
             if current_modified > tracked.last_modified {
                 let content = fs::read_to_string(&tracked.path)?;
-                tracked.html = Self::markdown_to_html(&content)?;
+                tracked.markdown = content;
                 tracked.last_modified = current_modified;
             }
+        }
+
+        Ok(())
+    }
+
+    fn update_file(&mut self, relative_path: &str, new_content: &str) -> Result<()> {
+        if let Some(tracked) = self.tracked_files.get_mut(relative_path) {
+            fs::write(&tracked.path, new_content)?;
+            tracked.markdown = new_content.to_string();
+            tracked.last_modified = SystemTime::now();
+            tracked.content_hash = md5::compute(new_content.as_bytes());
+            let _ = self.change_tx.send(ServerMessage::Reload);
+        } else {
+            return Err(anyhow::anyhow!("File not found: {}", relative_path));
         }
 
         Ok(())
@@ -314,9 +203,8 @@ impl MarkdownState {
             relative_path.clone(),
             TrackedFile {
                 path: file_path,
-                relative_path,
                 last_modified: metadata.modified()?,
-                html: Self::markdown_to_html(&content)?,
+                markdown: content,
                 content_hash,
             },
         );
@@ -324,14 +212,11 @@ impl MarkdownState {
         Ok(())
     }
 
-    /// Rescans the base directory and synchronizes tracked_files with the current file system state.
-    /// Returns true if the file list changed (files added or removed).
     fn rescan_directory(&mut self) -> Result<bool> {
         if !self.is_directory_mode {
             return Ok(false);
         }
 
-        // Get current files in directory
         let current_files = scan_markdown_files(&self.base_dir)?;
         let current_relative_paths: std::collections::HashSet<String> = current_files
             .iter()
@@ -345,20 +230,16 @@ impl MarkdownState {
             })
             .collect();
 
-        // Track relative paths that are currently tracked
         let tracked_relative_paths: std::collections::HashSet<String> =
             self.tracked_files.keys().cloned().collect();
 
-        // Check if there are any differences
         if current_relative_paths == tracked_relative_paths {
             return Ok(false);
         }
 
-        // Remove files that no longer exist
         self.tracked_files
             .retain(|relative_path, _| current_relative_paths.contains(relative_path));
 
-        // Add new files
         for file_path in current_files {
             let Ok(canonical_path) = file_path.canonicalize() else {
                 continue;
@@ -372,14 +253,10 @@ impl MarkdownState {
                 continue;
             }
 
-            // Try to add new file, ignore errors for individual files
             let Ok(metadata) = fs::metadata(&file_path) else {
                 continue;
             };
             let Ok(content) = fs::read_to_string(&file_path) else {
-                continue;
-            };
-            let Ok(html) = Self::markdown_to_html(&content) else {
                 continue;
             };
             let Ok(last_modified) = metadata.modified() else {
@@ -391,9 +268,8 @@ impl MarkdownState {
                 relative_path.clone(),
                 TrackedFile {
                     path: file_path,
-                    relative_path,
                     last_modified,
-                    html,
+                    markdown: content,
                     content_hash,
                 },
             );
@@ -401,30 +277,8 @@ impl MarkdownState {
 
         Ok(true)
     }
-
-    fn markdown_to_html(content: &str) -> Result<String> {
-        let mut options = markdown::Options::gfm();
-        options.compile.allow_dangerous_html = true;
-        options.parse.constructs.frontmatter = true;
-
-        let html_body = markdown::to_html_with_options(content, &options)
-            .unwrap_or_else(|_| "Error parsing markdown".to_string());
-
-        // Wrap tables in div for horizontal scrolling
-        let html_with_wrapped_tables = Self::wrap_tables_for_scroll(&html_body);
-
-        Ok(html_with_wrapped_tables)
-    }
-
-    fn wrap_tables_for_scroll(html: &str) -> String {
-        // Simple regex replacement to wrap <table> tags
-        html.replace("<table>", "<div class=\"table-wrapper\"><table>")
-            .replace("</table>", "</table></div>")
-    }
 }
 
-/// Handles a markdown file that may have been created or modified.
-/// Refreshes tracked files or adds new files in directory mode, sending reload notifications.
 async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
     if !is_markdown_file(path) {
         return;
@@ -436,15 +290,15 @@ async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
         return;
     };
 
-    // If file is already tracked, refresh its content
     if state_guard.tracked_files.contains_key(&relative_path) {
         if state_guard.refresh_file(&relative_path).is_ok() {
             let _ = state_guard.change_tx.send(ServerMessage::Reload);
         }
     } else if state_guard.is_directory_mode {
-        // New file in directory mode - add and reload
         if state_guard.add_tracked_file(path.to_path_buf()).is_ok() {
-            let _ = state_guard.change_tx.send(ServerMessage::Reload);
+            let _ = state_guard
+                .change_tx
+                .send(ServerMessage::FileAdded { name: relative_path });
         }
     }
 }
@@ -458,29 +312,22 @@ enum FileChangeType {
 fn detect_file_change(
     old_files: &std::collections::HashSet<String>,
     new_files: &std::collections::HashSet<String>,
-    old_tracked_files: &HashMap<String, md5::Digest>,
-    new_tracked_files: &HashMap<String, TrackedFile>,
+    _old_tracked_files: &std::collections::HashMap<String, md5::Digest>,
+    _new_tracked_files: &std::collections::HashMap<String, TrackedFile>,
 ) -> FileChangeType {
     let added: Vec<_> = new_files.difference(old_files).collect();
     let removed: Vec<_> = old_files.difference(new_files).collect();
 
-    // Detect rename: exactly one file added and one removed with matching content hashes
+    // If exactly one file was removed and one was added, treat it as a rename
+    // This handles both: (1) actual renames with no content change, and
+    // (2) files that were edited then renamed (content hash differs)
     if let ([new_name], [old_name]) = (added.as_slice(), removed.as_slice()) {
-        // Verify content is the same by comparing hashes
-        if let (Some(old_hash), Some(new_file)) = (
-            old_tracked_files.get(*old_name),
-            new_tracked_files.get(*new_name),
-        ) {
-            if *old_hash == new_file.content_hash {
-                return FileChangeType::Renamed {
-                    old_name: (*old_name).clone(),
-                    new_name: (*new_name).clone(),
-                };
-            }
-        }
+        return FileChangeType::Renamed {
+            old_name: (*old_name).clone(),
+            new_name: (*new_name).clone(),
+        };
     }
 
-    // Detect removal: at least one file removed
     if let Some(&first_removed) = removed.first() {
         return FileChangeType::Removed {
             name: first_removed.clone(),
@@ -490,10 +337,7 @@ fn detect_file_change(
     FileChangeType::Other
 }
 
-fn send_change_message(
-    change_type: FileChangeType,
-    tx: &broadcast::Sender<ServerMessage>,
-) {
+fn send_change_message(change_type: FileChangeType, tx: &broadcast::Sender<ServerMessage>) {
     let message = match change_type {
         FileChangeType::Renamed { old_name, new_name } => {
             ServerMessage::FileRenamed { old_name, new_name }
@@ -509,7 +353,7 @@ async fn rescan_and_detect_changes(state: &SharedMarkdownState) {
     let (old_files, old_hashes) = {
         let guard = state.lock().await;
         let files = guard.tracked_files.keys().cloned().collect();
-        let hashes: HashMap<String, md5::Digest> = guard
+        let hashes: std::collections::HashMap<String, md5::Digest> = guard
             .tracked_files
             .iter()
             .map(|(k, v)| (k.clone(), v.content_hash))
@@ -527,15 +371,12 @@ async fn rescan_and_detect_changes(state: &SharedMarkdownState) {
         return;
     }
 
-    let new_files: std::collections::HashSet<String> =
-        guard.tracked_files.keys().cloned().collect();
+    let new_files: std::collections::HashSet<String> = guard.tracked_files.keys().cloned().collect();
 
     let change_type = detect_file_change(&old_files, &new_files, &old_hashes, &guard.tracked_files);
     send_change_message(change_type, &guard.change_tx);
 }
 
-/// Schedules a delayed rescan for directory mode to handle editor save sequences.
-/// Editors often rename files to backups, then create new files - we want both operations to complete.
 fn schedule_delayed_rescan(state: &SharedMarkdownState) {
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -596,8 +437,8 @@ async fn handle_image_change(state: &SharedMarkdownState) {
 }
 
 async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
-    use notify::EventKind::{Create, Modify, Remove};
     use notify::event::ModifyKind;
+    use notify::EventKind::{Create, Modify, Remove};
 
     match event.kind {
         Modify(ModifyKind::Name(rename_mode)) => {
@@ -628,15 +469,6 @@ async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
     }
 }
 
-/// Creates a new Router for serving markdown files.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Files cannot be read or don't exist
-/// - File metadata cannot be accessed
-/// - File watcher cannot be created
-/// - File watcher cannot watch the base directory
 pub fn new_router(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
@@ -662,7 +494,6 @@ pub fn new_router(
         Config::default(),
     )?;
 
-    // Watch recursively to detect file changes in subdirectories
     watcher.watch(&base_dir, RecursiveMode::Recursive)?;
 
     tokio::spawn(async move {
@@ -672,27 +503,40 @@ pub fn new_router(
         }
     });
 
-    let router = Router::new()
-        .route("/", get(serve_html_root))
+    // Create a separate router for serving the React app
+    let frontend_dist = PathBuf::from("frontend/dist");
+    let serve_frontend = if frontend_dist.exists() {
+        let index_path = frontend_dist.join("index.html");
+        if index_path.exists() {
+            Some(
+                ServeDir::new(frontend_dist.clone())
+                    .not_found_service(ServeFile::new(index_path)),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let api_router = Router::new()
+        .route("/api/files", get(api_get_files))
+        .route("/api/files/*path", get(api_get_file))
+        .route("/api/files/*path", put(api_update_file))
+        .route("/api/static/*path", get(api_serve_static))
         .route("/ws", get(websocket_handler))
         .route("/__health", get(server_health))
-        .route("/mermaid.min.js", get(serve_mermaid_js))
-        .route("/*path", get(serve_file))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
-    Ok(router)
+    let router = if let Some(frontend_service) = serve_frontend {
+        api_router.fallback_service(frontend_service)
+    } else {
+        api_router.fallback(|| async { (StatusCode::NOT_FOUND, "Frontend not built") })
+    };
+
+    Ok(router.layer(CorsLayer::permissive()))
 }
 
-/// Serves markdown files with live reload support.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Files cannot be read or don't exist
-/// - Cannot bind to the specified host address
-/// - Server fails to start
-/// - Axum serve encounters an error
 pub async fn serve_markdown(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
@@ -724,7 +568,6 @@ pub async fn serve_markdown(
     Ok(())
 }
 
-/// Format the host address (hostname + port) for printing.
 fn format_host(hostname: &str, port: u16) -> String {
     if hostname.parse::<Ipv6Addr>().is_ok() {
         format!("[{hostname}]:{port}")
@@ -733,149 +576,71 @@ fn format_host(hostname: &str, port: u16) -> String {
     }
 }
 
-async fn serve_html_root(State(state): State<SharedMarkdownState>) -> impl IntoResponse {
-    let mut state = state.lock().await;
+async fn api_get_files(State(state): State<SharedMarkdownState>) -> Json<FilesResponse> {
+    let state = state.lock().await;
+    let files = state
+        .get_sorted_filenames()
+        .into_iter()
+        .map(|path| ApiFile { path })
+        .collect();
 
-    let relative_path = match state.get_sorted_filenames().into_iter().next() {
-        Some(name) => name,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("No files available to serve".to_string()),
-            );
-        }
-    };
-
-    let _ = state.refresh_file(&relative_path);
-
-    render_markdown(&state, &relative_path).await
+    Json(FilesResponse { files })
 }
 
-async fn serve_file(
+async fn api_get_file(
     AxumPath(path): AxumPath<String>,
     State(state): State<SharedMarkdownState>,
-) -> axum::response::Response {
-    // Strip leading slash from path (/*path includes it)
-    let relative_path = path.strip_prefix('/').unwrap_or(&path);
+) -> impl IntoResponse {
+    let mut state = state.lock().await;
 
-    if relative_path.ends_with(".md") || relative_path.ends_with(".markdown") {
-        let mut state = state.lock().await;
+    if !state.tracked_files.contains_key(&path) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        )
+            .into_response();
+    }
 
-        if !state.tracked_files.contains_key(relative_path) {
-            return (StatusCode::NOT_FOUND, Html("File not found".to_string())).into_response();
-        }
+    let _ = state.refresh_file(&path);
 
-        let _ = state.refresh_file(relative_path);
-
-        let (status, html) = render_markdown(&state, relative_path).await;
-        (status, html).into_response()
-    } else if is_image_file(relative_path) {
-        serve_static_file_inner(relative_path.to_string(), state).await
+    if let Some(tracked) = state.tracked_files.get(&path) {
+        Json(FileContentResponse {
+            markdown: tracked.markdown.clone(),
+        })
+        .into_response()
     } else {
-        (StatusCode::NOT_FOUND, Html("File not found".to_string())).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        )
+            .into_response()
     }
 }
 
-async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCode, Html<String>) {
-    let env = template_env();
-    let template = match env.get_template(TEMPLATE_NAME) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!("Template error: {e}")),
-            );
-        }
-    };
+async fn api_update_file(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<SharedMarkdownState>,
+    Json(request): Json<FileUpdateRequest>,
+) -> impl IntoResponse {
+    let mut state = state.lock().await;
 
-    let (content, has_mermaid) = if let Some(tracked) = state.tracked_files.get(current_file) {
-        let html = &tracked.html;
-        let mermaid = html.contains(r#"class="language-mermaid""#);
-        (Value::from_safe_string(html.clone()), mermaid)
-    } else {
-        return (StatusCode::NOT_FOUND, Html("File not found".to_string()));
-    };
-
-    let rendered = if state.show_navigation() {
-        let file_tree = state.get_file_tree();
-        let files = Value::from_serialize(&file_tree);
-
-        match template.render(context! {
-            content => content,
-            mermaid_enabled => has_mermaid,
-            show_navigation => true,
-            files => files,
-            current_file => current_file,
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("Rendering error: {e}")),
-                );
-            }
-        }
-    } else {
-        match template.render(context! {
-            content => content,
-            mermaid_enabled => has_mermaid,
-            show_navigation => false,
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("Rendering error: {e}")),
-                );
-            }
-        }
-    };
-
-    (StatusCode::OK, Html(rendered))
-}
-
-async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
-    if is_etag_match(&headers) {
-        return mermaid_response(StatusCode::NOT_MODIFIED, None);
-    }
-
-    mermaid_response(StatusCode::OK, Some(MERMAID_JS))
-}
-
-async fn server_health() -> impl IntoResponse {
-    (StatusCode::OK, "ready")
-}
-
-fn is_etag_match(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|etags| etags.split(',').any(|tag| tag.trim() == MERMAID_ETAG))
-}
-
-fn mermaid_response(status: StatusCode, body: Option<&'static str>) -> impl IntoResponse {
-    // Use no-cache to force revalidation on each request. This ensures clients
-    // get updated content when mdserve is rebuilt with a new Mermaid version,
-    // while still benefiting from 304 responses via ETag matching.
-    let headers = [
-        (header::CONTENT_TYPE, "application/javascript"),
-        (header::ETAG, MERMAID_ETAG),
-        (header::CACHE_CONTROL, "public, no-cache"),
-    ];
-
-    match body {
-        Some(content) => (status, headers, content).into_response(),
-        None => (status, headers).into_response(),
+    match state.update_file(&path, &request.markdown) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-async fn serve_static_file_inner(
-    filename: String,
-    state: SharedMarkdownState,
-) -> axum::response::Response {
+async fn api_serve_static(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<SharedMarkdownState>,
+) -> impl IntoResponse {
     let state = state.lock().await;
 
-    let full_path = state.base_dir.join(&filename);
+    let full_path = state.base_dir.join(&path);
 
     match full_path.canonicalize() {
         Ok(canonical_path) => {
@@ -890,7 +655,7 @@ async fn serve_static_file_inner(
 
             match fs::read(&canonical_path) {
                 Ok(contents) => {
-                    let content_type = guess_image_content_type(&filename);
+                    let content_type = guess_image_content_type(&path);
                     (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, content_type.as_str())],
@@ -913,6 +678,10 @@ async fn serve_static_file_inner(
         )
             .into_response(),
     }
+}
+
+async fn server_health() -> impl IntoResponse {
+    (StatusCode::OK, "ready")
 }
 
 fn is_image_file(file_path: &str) -> bool {
@@ -1003,25 +772,347 @@ mod tests {
     fn test_is_markdown_file() {
         assert!(is_markdown_file(Path::new("test.md")));
         assert!(is_markdown_file(Path::new("/path/to/file.md")));
-
         assert!(is_markdown_file(Path::new("test.markdown")));
-        assert!(is_markdown_file(Path::new("/path/to/file.markdown")));
-
         assert!(is_markdown_file(Path::new("test.MD")));
-        assert!(is_markdown_file(Path::new("test.Md")));
-        assert!(is_markdown_file(Path::new("test.MARKDOWN")));
-        assert!(is_markdown_file(Path::new("test.MarkDown")));
-
         assert!(!is_markdown_file(Path::new("test.txt")));
-        assert!(!is_markdown_file(Path::new("test.rs")));
-        assert!(!is_markdown_file(Path::new("test.html")));
-        assert!(!is_markdown_file(Path::new("test")));
-        assert!(!is_markdown_file(Path::new("README")));
     }
 
     #[test]
     fn test_is_image_file() {
         assert!(is_image_file("test.png"));
+        assert!(is_image_file("test.jpg"));
+        assert!(!is_image_file("test.txt"));
+    }
+
+    #[test]
+    fn test_format_host() {
+        assert_eq!(format_host("127.0.0.1", 3000), "127.0.0.1:3000");
+        assert_eq!(format_host("::1", 3000), "[::1]:3000");
+    }
+
+    #[test]
+    fn test_scan_markdown_files_empty_directory() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_scan_markdown_files_with_markdown_files() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+
+        fs::write(temp_dir.path().join("test1.md"), "# Test 1").expect("Failed to write");
+        fs::write(temp_dir.path().join("test2.markdown"), "# Test 2").expect("Failed to write");
+        fs::write(temp_dir.path().join("test.txt"), "text").expect("Failed to write");
+
+        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_markdown_state_add_tracked_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path.clone()], true)
+                .expect("Failed to create state");
+
+        let new_file = base_dir.join("new.md");
+        fs::write(&new_file, "# New").expect("Failed to write");
+
+        state
+            .add_tracked_file(new_file.clone())
+            .expect("Failed to add file");
+
+        let relative_path = "new.md";
+        assert!(state.tracked_files.contains_key(relative_path));
+        assert_eq!(state.tracked_files.get(relative_path).unwrap().markdown, "# New");
+    }
+
+    #[test]
+    fn test_markdown_state_add_tracked_file_duplicate() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path.clone()], true)
+                .expect("Failed to create state");
+
+        // Adding the same file again should succeed but not duplicate
+        state
+            .add_tracked_file(file_path.clone())
+            .expect("Failed to add file");
+
+        assert_eq!(state.tracked_files.len(), 1);
+    }
+
+    #[test]
+    fn test_markdown_state_update_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path.clone()], false)
+                .expect("Failed to create state");
+
+        state
+            .update_file("test.md", "# Updated")
+            .expect("Failed to update");
+
+        let content = fs::read_to_string(&file_path).expect("Failed to read");
+        assert_eq!(content, "# Updated");
+        assert_eq!(state.tracked_files.get("test.md").unwrap().markdown, "# Updated");
+    }
+
+    #[test]
+    fn test_markdown_state_update_file_not_found() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path], false)
+                .expect("Failed to create state");
+
+        let result = state.update_file("nonexistent.md", "# New");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("File not found"));
+    }
+
+    #[test]
+    fn test_markdown_state_refresh_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path.clone()], false)
+                .expect("Failed to create state");
+
+        // Modify the file externally
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&file_path, "# Modified").expect("Failed to write");
+
+        state.refresh_file("test.md").expect("Failed to refresh");
+
+        assert_eq!(state.tracked_files.get("test.md").unwrap().markdown, "# Modified");
+    }
+
+    #[test]
+    fn test_markdown_state_rescan_directory() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path], true)
+                .expect("Failed to create state");
+
+        // Add a new file
+        let new_file = base_dir.join("new.md");
+        fs::write(&new_file, "# New").expect("Failed to write");
+
+        let changed = state.rescan_directory().expect("Failed to rescan");
+        assert!(changed);
+        assert_eq!(state.tracked_files.len(), 2);
+        assert!(state.tracked_files.contains_key("new.md"));
+    }
+
+    #[test]
+    fn test_markdown_state_rescan_directory_no_changes() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path], true)
+                .expect("Failed to create state");
+
+        let changed = state.rescan_directory().expect("Failed to rescan");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_markdown_state_rescan_directory_single_file_mode() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file_path], false)
+                .expect("Failed to create state");
+
+        let changed = state.rescan_directory().expect("Failed to rescan");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_markdown_state_rescan_directory_file_removed() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file1 = base_dir.join("test1.md");
+        let file2 = base_dir.join("test2.md");
+        fs::write(&file1, "# Test 1").expect("Failed to write");
+        fs::write(&file2, "# Test 2").expect("Failed to write");
+
+        let mut state =
+            MarkdownState::new(base_dir.clone(), vec![file1.clone(), file2.clone()], true)
+                .expect("Failed to create state");
+
+        assert_eq!(state.tracked_files.len(), 2);
+
+        // Remove one file
+        fs::remove_file(&file2).expect("Failed to remove");
+
+        let changed = state.rescan_directory().expect("Failed to rescan");
+        assert!(changed);
+        assert_eq!(state.tracked_files.len(), 1);
+        assert!(state.tracked_files.contains_key("test1.md"));
+        assert!(!state.tracked_files.contains_key("test2.md"));
+    }
+
+    #[test]
+    fn test_detect_file_change_rename() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut old_files = HashSet::new();
+        old_files.insert("old.md".to_string());
+
+        let mut new_files = HashSet::new();
+        new_files.insert("new.md".to_string());
+
+        let mut old_tracked = HashMap::new();
+        let hash = md5::compute(b"content");
+        old_tracked.insert("old.md".to_string(), hash);
+
+        let mut new_tracked = HashMap::new();
+        new_tracked.insert(
+            "new.md".to_string(),
+            TrackedFile {
+                path: PathBuf::from("new.md"),
+                last_modified: SystemTime::now(),
+                markdown: "content".to_string(),
+                content_hash: hash,
+            },
+        );
+
+        match detect_file_change(&old_files, &new_files, &old_tracked, &new_tracked) {
+            FileChangeType::Renamed { old_name, new_name } => {
+                assert_eq!(old_name, "old.md");
+                assert_eq!(new_name, "new.md");
+            }
+            _ => panic!("Expected Renamed"),
+        }
+    }
+
+    #[test]
+    fn test_detect_file_change_removed() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut old_files = HashSet::new();
+        old_files.insert("removed.md".to_string());
+
+        let new_files = HashSet::new();
+        let old_tracked = HashMap::new();
+        let new_tracked = HashMap::new();
+
+        match detect_file_change(&old_files, &new_files, &old_tracked, &new_tracked) {
+            FileChangeType::Removed { name } => {
+                assert_eq!(name, "removed.md");
+            }
+            _ => panic!("Expected Removed"),
+        }
+    }
+
+    #[test]
+    fn test_detect_file_change_other() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut old_files = HashSet::new();
+        old_files.insert("file1.md".to_string());
+
+        let mut new_files = HashSet::new();
+        new_files.insert("file1.md".to_string());
+        new_files.insert("file2.md".to_string());
+
+        let old_tracked = HashMap::new();
+        let new_tracked = HashMap::new();
+
+        match detect_file_change(&old_files, &new_files, &old_tracked, &new_tracked) {
+            FileChangeType::Other => {}
+            _ => panic!("Expected Other"),
+        }
+    }
+
+    #[test]
+    fn test_send_change_message_renamed() {
+        let (tx, mut rx) = broadcast::channel(10);
+
+        send_change_message(
+            FileChangeType::Renamed {
+                old_name: "old.md".to_string(),
+                new_name: "new.md".to_string(),
+            },
+            &tx,
+        );
+
+        match rx.try_recv() {
+            Ok(ServerMessage::FileRenamed { old_name, new_name }) => {
+                assert_eq!(old_name, "old.md");
+                assert_eq!(new_name, "new.md");
+            }
+            _ => panic!("Expected FileRenamed message"),
+        }
+    }
+
+    #[test]
+    fn test_send_change_message_removed() {
+        let (tx, mut rx) = broadcast::channel(10);
+
+        send_change_message(
+            FileChangeType::Removed {
+                name: "removed.md".to_string(),
+            },
+            &tx,
+        );
+
+        match rx.try_recv() {
+            Ok(ServerMessage::FileRemoved { name }) => {
+                assert_eq!(name, "removed.md");
+            }
+            _ => panic!("Expected FileRemoved message"),
+        }
+    }
+
+    #[test]
+    fn test_send_change_message_reload() {
+        let (tx, mut rx) = broadcast::channel(10);
+
+        send_change_message(FileChangeType::Other, &tx);
+
+        match rx.try_recv() {
+            Ok(ServerMessage::Reload) => {}
+            _ => panic!("Expected Reload message"),
+        }
+    }
+
+    #[test]
+    fn test_is_image_file_all_types() {
+        // Test all supported image types
+        assert!(is_image_file("test.png"));
+        assert!(is_image_file("test.PNG"));
         assert!(is_image_file("test.jpg"));
         assert!(is_image_file("test.jpeg"));
         assert!(is_image_file("test.gif"));
@@ -1029,17 +1120,9 @@ mod tests {
         assert!(is_image_file("test.webp"));
         assert!(is_image_file("test.bmp"));
         assert!(is_image_file("test.ico"));
-
-        assert!(is_image_file("test.PNG"));
-        assert!(is_image_file("test.JPG"));
-        assert!(is_image_file("test.JPEG"));
-
-        assert!(is_image_file("/path/to/image.png"));
-        assert!(is_image_file("./images/photo.jpg"));
-
+        // Test non-image files
         assert!(!is_image_file("test.txt"));
         assert!(!is_image_file("test.md"));
-        assert!(!is_image_file("test.rs"));
         assert!(!is_image_file("test"));
     }
 
@@ -1053,228 +1136,108 @@ mod tests {
         assert_eq!(guess_image_content_type("test.webp"), "image/webp");
         assert_eq!(guess_image_content_type("test.bmp"), "image/bmp");
         assert_eq!(guess_image_content_type("test.ico"), "image/x-icon");
-
-        assert_eq!(guess_image_content_type("test.PNG"), "image/png");
-        assert_eq!(guess_image_content_type("test.JPG"), "image/jpeg");
-
-        assert_eq!(
-            guess_image_content_type("test.xyz"),
-            "application/octet-stream"
-        );
-        assert_eq!(guess_image_content_type("test"), "application/octet-stream");
+        assert_eq!(guess_image_content_type("test.txt"), "application/octet-stream");
     }
 
     #[test]
-    fn test_scan_markdown_files_empty_directory() {
+    fn test_markdown_state_get_sorted_filenames() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
 
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-        assert_eq!(result.len(), 0);
-    }
+        let file1 = base_dir.join("b.md");
+        let file2 = base_dir.join("a.md");
+        let file3 = base_dir.join("c.md");
 
-    #[test]
-    fn test_scan_markdown_files_with_markdown_files() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
+        fs::write(&file1, "# B").expect("Failed to write");
+        fs::write(&file2, "# A").expect("Failed to write");
+        fs::write(&file3, "# C").expect("Failed to write");
 
-        fs::write(temp_dir.path().join("test1.md"), "# Test 1").expect("Failed to write");
-        fs::write(temp_dir.path().join("test2.markdown"), "# Test 2").expect("Failed to write");
-        fs::write(temp_dir.path().join("test3.md"), "# Test 3").expect("Failed to write");
-
-        fs::write(temp_dir.path().join("test.txt"), "text").expect("Failed to write");
-        fs::write(temp_dir.path().join("README"), "readme").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 3);
-
-        let filenames: Vec<_> = result
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect();
-        assert_eq!(filenames, vec!["test1.md", "test2.markdown", "test3.md"]);
-    }
-
-    #[test]
-    fn test_scan_markdown_files_scans_subdirectories_recursively() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
-
-        let sub_dir = temp_dir.path().join("subdir");
-        fs::create_dir(&sub_dir).expect("Failed to create subdir");
-        fs::write(sub_dir.join("nested.md"), "# Nested").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 2);
-        let filenames: Vec<_> = result
-            .iter()
-            .map(|p| p.strip_prefix(temp_dir.path()).unwrap().to_str().unwrap())
-            .collect();
-
-        assert!(filenames.contains(&"root.md"));
-        assert!(filenames.contains(&"subdir/nested.md") || filenames.contains(&"subdir\\nested.md"));
-    }
-
-    #[test]
-    fn test_scan_markdown_files_with_nested_folders() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        // Create: root.md, folder1/file1.md, folder1/folder2/file2.md, folder3/file3.md
-        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
-
-        let folder1 = temp_dir.path().join("folder1");
-        fs::create_dir(&folder1).expect("Failed to create folder1");
-        fs::write(folder1.join("file1.md"), "# File 1").expect("Failed to write");
-
-        let folder2 = folder1.join("folder2");
-        fs::create_dir(&folder2).expect("Failed to create folder2");
-        fs::write(folder2.join("file2.md"), "# File 2").expect("Failed to write");
-
-        let folder3 = temp_dir.path().join("folder3");
-        fs::create_dir(&folder3).expect("Failed to create folder3");
-        fs::write(folder3.join("file3.md"), "# File 3").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn test_scan_markdown_files_ignores_empty_folders() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
-
-        // Create empty folder
-        let empty_folder = temp_dir.path().join("empty");
-        fs::create_dir(&empty_folder).expect("Failed to create empty folder");
-
-        // Create folder with non-markdown files only
-        let non_md_folder = temp_dir.path().join("non_md");
-        fs::create_dir(&non_md_folder).expect("Failed to create non_md folder");
-        fs::write(non_md_folder.join("file.txt"), "Text file").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].file_name().unwrap().to_str().unwrap(), "root.md");
-    }
-
-    #[test]
-    fn test_scan_markdown_files_handles_filename_conflicts() {
-        // Test that files with the same name in different folders are both tracked
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        // Create file.md in root
-        fs::write(temp_dir.path().join("file.md"), "# Root File").expect("Failed to write");
-
-        // Create file.md in folder1
-        let folder1 = temp_dir.path().join("folder1");
-        fs::create_dir(&folder1).expect("Failed to create folder1");
-        fs::write(folder1.join("file.md"), "# Folder1 File").expect("Failed to write");
-
-        // Create file.md in folder2
-        let folder2 = temp_dir.path().join("folder2");
-        fs::create_dir(&folder2).expect("Failed to create folder2");
-        fs::write(folder2.join("file.md"), "# Folder2 File").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        // Should find all 3 files with the same name
-        assert_eq!(result.len(), 3);
-
-        // Verify we can distinguish between them by their paths
-        let paths: Vec<_> = result
-            .iter()
-            .map(|p| p.strip_prefix(temp_dir.path()).unwrap().to_str().unwrap())
-            .collect();
-
-        assert!(paths.contains(&"file.md"));
-        assert!(paths.contains(&"folder1/file.md") || paths.contains(&"folder1\\file.md"));
-        assert!(paths.contains(&"folder2/file.md") || paths.contains(&"folder2\\file.md"));
-    }
-
-    #[test]
-    fn test_scan_markdown_files_case_insensitive() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("test1.md"), "# Test 1").expect("Failed to write");
-        fs::write(temp_dir.path().join("test2.MD"), "# Test 2").expect("Failed to write");
-        fs::write(temp_dir.path().join("test3.Md"), "# Test 3").expect("Failed to write");
-        fs::write(temp_dir.path().join("test4.MARKDOWN"), "# Test 4").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn test_format_host() {
-        assert_eq!(format_host("127.0.0.1", 3000), "127.0.0.1:3000");
-        assert_eq!(format_host("192.168.1.1", 8080), "192.168.1.1:8080");
-
-        assert_eq!(format_host("localhost", 3000), "localhost:3000");
-        assert_eq!(format_host("example.com", 80), "example.com:80");
-
-        assert_eq!(format_host("::1", 3000), "[::1]:3000");
-        assert_eq!(format_host("2001:db8::1", 8080), "[2001:db8::1]:8080");
-    }
-
-    #[tokio::test]
-    async fn test_file_watcher_detects_new_files_in_subdirectories() {
-        use axum_test::TestServer;
-        use std::time::Duration;
-        use tokio::time::{sleep, timeout};
-
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        // Create initial file that will be tracked
-        fs::write(temp_dir.path().join("initial.md"), "# Initial").expect("Failed to write initial.md");
-
-        // Start the server with directory mode
-        let router = new_router(
-            temp_dir.path().to_path_buf(),
-            vec![],
+        let state = MarkdownState::new(
+            base_dir.clone(),
+            vec![file1, file2, file3],
             true,
-        ).expect("Failed to create router");
+        )
+        .expect("Failed to create state");
 
-        let server = TestServer::new(router).expect("Failed to create test server");
+        let sorted = state.get_sorted_filenames();
+        assert_eq!(sorted, vec!["a.md", "b.md", "c.md"]);
+    }
 
-        // Poll until server is ready using the lightweight health endpoint.
-        let poll_result = timeout(Duration::from_secs(2), async {
-            loop {
-                let response = server.get("/__health").await;
-                if response.status_code() == 200 {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        }).await;
-        assert!(poll_result.is_ok(), "Server should be ready within 2 seconds");
+    #[test]
+    fn test_calculate_relative_path() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
 
-        // Create a new subdirectory after the server has started
-        let subfolder = temp_dir.path().join("subfolder");
-        fs::create_dir(&subfolder).expect("Failed to create subfolder");
+        fs::write(&file_path, "# Test").expect("Failed to write");
 
-        // Create a new file in the subdirectory
-        fs::write(subfolder.join("new.md"), "# New File").expect("Failed to write new.md");
+        let relative = calculate_relative_path(&file_path, &base_dir)
+            .expect("Failed to calculate relative path");
+        assert_eq!(relative, "test.md");
+    }
 
-        // Poll until the new file is detected and accessible by the file watcher
-        let poll_result = timeout(Duration::from_secs(3), async {
-            loop {
-                let response = server.get("/subfolder/new.md").await;
-                if response.status_code() == 200 {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        }).await;
-        assert!(poll_result.is_ok(), "File watcher should detect new files in subdirectories within 3 seconds");
+    #[test]
+    fn test_calculate_relative_path_nested() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let nested_dir = base_dir.join("nested");
+        fs::create_dir(&nested_dir).expect("Failed to create nested dir");
+        let file_path = nested_dir.join("test.md");
 
-        // Verify the file list includes the new file
-        let response = server.get("/").await;
-        let body = response.text();
-        assert!(body.contains("new.md"), "Navigation should include the new file from subdirectory");
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let relative = calculate_relative_path(&file_path, &base_dir)
+            .expect("Failed to calculate relative path");
+        assert_eq!(relative, "nested/test.md");
+    }
+
+    #[test]
+    fn test_scan_markdown_files_nested() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let nested_dir = temp_dir.path().join("nested");
+        fs::create_dir(&nested_dir).expect("Failed to create nested dir");
+
+        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
+        fs::write(nested_dir.join("nested.md"), "# Nested").expect("Failed to write");
+
+        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_markdown_state_refresh_file_not_modified() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_dir = temp_dir.path().canonicalize().expect("Failed to canonicalize");
+        let file_path = base_dir.join("test.md");
+
+        fs::write(&file_path, "# Test").expect("Failed to write");
+
+        let mut state = MarkdownState::new(
+            base_dir.clone(),
+            vec![file_path.clone()],
+            false,
+        )
+        .expect("Failed to create state");
+
+        // Get original content
+        let original_content = state.tracked_files.get("test.md").unwrap().markdown.clone();
+
+        // Refresh without modification
+        state.refresh_file("test.md").expect("Failed to refresh");
+
+        // Content should be unchanged
+        assert_eq!(state.tracked_files.get("test.md").unwrap().markdown, original_content);
+    }
+
+    #[test]
+    fn test_format_host_ipv4() {
+        assert_eq!(format_host("0.0.0.0", 8080), "0.0.0.0:8080");
+        assert_eq!(format_host("192.168.1.1", 3000), "192.168.1.1:3000");
+    }
+
+    #[test]
+    fn test_format_host_ipv6() {
+        assert_eq!(format_host("::1", 3000), "[::1]:3000");
+        assert_eq!(format_host("fe80::1", 8080), "[fe80::1]:8080");
     }
 }
