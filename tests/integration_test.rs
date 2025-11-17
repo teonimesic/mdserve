@@ -732,7 +732,7 @@ async fn test_websocket_request_refresh_message() {
 #[tokio::test]
 async fn test_websocket_close_message() {
     let (server, _temp_file) = create_test_server_with_http("# Test").await;
-    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+    let websocket = server.get_websocket("/ws").await.into_websocket().await;
 
     // Send Close message
     websocket.close().await;
