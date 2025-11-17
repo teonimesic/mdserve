@@ -516,3 +516,162 @@ test('should handle relative links in nested markdown files', async ({ page }) =
   // Verify the URL reflects the correct file
   expect(page.url()).toContain('root-file.md')
 })
+
+test('should render mermaid diagrams', async ({ page }) => {
+  // Create a markdown file with a mermaid diagram
+  writeFileSync(
+    join(testDir, 'with-mermaid.md'),
+    `# Document with Mermaid Diagram
+
+\`\`\`mermaid
+graph TD
+    A[Start] --> B{Is it working?}
+    B -->|Yes| C[Great!]
+    B -->|No| D[Debug]
+    D --> A
+\`\`\`
+
+This is a test mermaid diagram.`
+  )
+
+  await page.goto(SERVER_URL)
+  await page.waitForSelector('.file-list')
+
+  // Wait for file to appear and click it
+  await page.waitForTimeout(2000)
+  const mermaidDoc = page.getByText('with-mermaid.md')
+  await mermaidDoc.click()
+
+  await page.waitForSelector('h1')
+
+  // Verify the mermaid diagram wrapper exists
+  const mermaidWrapper = page.locator('.mermaid-wrapper')
+  await expect(mermaidWrapper).toBeVisible()
+
+  // Verify the SVG element is rendered (mermaid renders to SVG)
+  const svgElement = page.locator('.mermaid-wrapper svg')
+  await expect(svgElement).toBeVisible()
+
+  // Verify some of the text content appears in the diagram
+  const diagramContent = page.locator('.mermaid-wrapper')
+  await expect(diagramContent).toContainText('Start')
+})
+
+test('should change theme when selecting from theme modal', async ({ page }) => {
+  await page.goto(SERVER_URL)
+  await page.waitForSelector('.file-list')
+
+  // Click the theme toggle button
+  const themeToggle = page.locator('.theme-toggle')
+  await expect(themeToggle).toBeVisible()
+  await themeToggle.click()
+
+  // Wait for theme modal to appear
+  const themeModal = page.locator('.theme-modal')
+  await expect(themeModal).toBeVisible()
+
+  // Get initial theme from html data attribute
+  const initialTheme = await page.locator('html').getAttribute('data-theme')
+
+  // Select a different theme (e.g., if current is 'catppuccin-mocha', select 'light')
+  const targetTheme = initialTheme === 'light' ? 'dark' : 'light'
+  const themeCard = page.locator(`.theme-card[data-theme="${targetTheme}"]`)
+  await themeCard.click()
+
+  // Wait for modal to close
+  await expect(themeModal).not.toBeVisible()
+
+  // Verify theme changed in html data attribute (wait for it to apply)
+  await page.waitForFunction(
+    (expected) => document.documentElement.getAttribute('data-theme') === expected,
+    targetTheme,
+    { timeout: 5000 }
+  )
+  const newTheme = await page.locator('html').getAttribute('data-theme')
+  expect(newTheme).toBe(targetTheme)
+
+  // Verify theme persists after reload
+  await page.reload()
+  await page.waitForSelector('.file-list')
+  const persistedTheme = await page.locator('html').getAttribute('data-theme')
+  expect(persistedTheme).toBe(targetTheme)
+})
+
+test('should resize sidebar when dragging resize handle', async ({ page }) => {
+  await page.goto(SERVER_URL)
+  await page.waitForSelector('.file-list')
+
+  // Get initial sidebar width
+  const sidebar = page.locator('.sidebar')
+  const initialBox = await sidebar.boundingBox()
+  expect(initialBox).not.toBeNull()
+  const initialWidth = initialBox!.width
+
+  // Find the resize handle
+  const resizeHandle = page.locator('.sidebar-resize-handle')
+  await expect(resizeHandle).toBeVisible()
+
+  // Get the handle position
+  const handleBox = await resizeHandle.boundingBox()
+  expect(handleBox).not.toBeNull()
+
+  // Drag the handle to resize (drag 100px to the right)
+  await page.mouse.move(handleBox!.x + handleBox!.width / 2, handleBox!.y + handleBox!.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(handleBox!.x + handleBox!.width / 2 + 100, handleBox!.y + handleBox!.height / 2)
+  await page.mouse.up()
+
+  // Wait for resize to complete
+  await page.waitForTimeout(100)
+
+  // Verify sidebar width increased
+  const newBox = await sidebar.boundingBox()
+  expect(newBox).not.toBeNull()
+  const newWidth = newBox!.width
+
+  // Width should have increased by approximately 100px (allow some tolerance)
+  expect(newWidth).toBeGreaterThan(initialWidth + 80)
+  expect(newWidth).toBeLessThan(initialWidth + 120)
+})
+
+test('should collapse and expand sidebar when clicking toggle button', async ({ page }) => {
+  await page.goto(SERVER_URL)
+  await page.waitForSelector('.file-list')
+
+  // Get initial sidebar width
+  const sidebar = page.locator('.sidebar')
+  const initialBox = await sidebar.boundingBox()
+  expect(initialBox).not.toBeNull()
+  const initialWidth = initialBox!.width
+
+  // Find the sidebar toggle button
+  const sidebarToggle = page.locator('.sidebar-toggle')
+  await expect(sidebarToggle).toBeVisible()
+
+  // Click to collapse
+  await sidebarToggle.click()
+  await page.waitForTimeout(300) // Wait for animation
+
+  // Verify sidebar is collapsed (much narrower)
+  const collapsedBox = await sidebar.boundingBox()
+  expect(collapsedBox).not.toBeNull()
+  const collapsedWidth = collapsedBox!.width
+  expect(collapsedWidth).toBeLessThan(initialWidth / 2)
+
+  // Verify app has sidebar-collapsed class
+  const app = page.locator('.app')
+  await expect(app).toHaveClass(/sidebar-collapsed/)
+
+  // Click to expand
+  await sidebarToggle.click()
+  await page.waitForTimeout(300) // Wait for animation
+
+  // Verify sidebar is expanded again
+  const expandedBox = await sidebar.boundingBox()
+  expect(expandedBox).not.toBeNull()
+  const expandedWidth = expandedBox!.width
+  expect(expandedWidth).toBeGreaterThan(collapsedWidth)
+
+  // Verify app no longer has sidebar-collapsed class
+  await expect(app).not.toHaveClass(/sidebar-collapsed/)
+})
