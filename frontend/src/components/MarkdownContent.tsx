@@ -2,11 +2,13 @@ import { ReactNode, createElement, memo } from 'react'
 import { CodeBlock } from './CodeBlock'
 import { MermaidDiagram } from './MermaidDiagram'
 import { TodoCheckbox } from './TodoCheckbox'
+import { resolveRelativePath, isRelativeMarkdownLink } from '../utils/pathResolver'
 
 interface MarkdownContentProps {
   html: string
   filePath: string
   theme?: string
+  onLinkClick?: (path: string) => void
 }
 
 // Convert CSS string to React style object
@@ -27,7 +29,7 @@ function parseStyleString(styleStr: string): Record<string, string> {
 
 // Memoized MarkdownContent - only re-renders if html, filePath, or theme change
 // This prevents unnecessary re-renders when sidebar state changes
-export const MarkdownContent = memo(function MarkdownContent({ html, filePath, theme }: MarkdownContentProps) {
+export const MarkdownContent = memo(function MarkdownContent({ html, filePath, theme, onLinkClick }: MarkdownContentProps) {
   const parser = new DOMParser()
   const doc = parser.parseFromString(html, 'text/html')
 
@@ -90,6 +92,44 @@ export const MarkdownContent = memo(function MarkdownContent({ html, filePath, t
               {children}
             </li>
           )
+        }
+      }
+
+      // Handle anchor tags for relative markdown links
+      if (tagName === 'a' && onLinkClick) {
+        const href = element.getAttribute('href')
+        if (href && isRelativeMarkdownLink(href)) {
+          // This is a relative markdown link - handle it specially
+          const resolvedPath = resolveRelativePath(filePath, href)
+
+          // Get all children
+          const children = Array.from(element.childNodes).map((child, i) =>
+            convertNodeToReact(child, i)
+          )
+
+          // Get other attributes
+          const props: Record<string, any> = { key }
+          for (let i = 0; i < element.attributes.length; i++) {
+            const attr = element.attributes[i]
+            if (attr && attr.name !== 'href') {
+              if (attr.name === 'class') {
+                props.className = attr.value
+              } else if (attr.name === 'style') {
+                props.style = parseStyleString(attr.value)
+              } else {
+                props[attr.name] = attr.value
+              }
+            }
+          }
+
+          // Add click handler to intercept navigation
+          props.href = href
+          props.onClick = (e: React.MouseEvent) => {
+            e.preventDefault()
+            onLinkClick(resolvedPath)
+          }
+
+          return createElement('a', props, ...children)
         }
       }
 

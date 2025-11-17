@@ -275,7 +275,7 @@ function App() {
         )}
       </div>
       <div ref={contentRef} className="content">
-        {content && <MarkdownContent html={content} filePath={currentPath} theme={theme} />}
+        {content && <MarkdownContent html={content} filePath={currentPath} theme={theme} onLinkClick={loadFile} />}
       </div>
     </div>
   )

@@ -130,16 +130,19 @@ async fn test_file_modification_updates_via_websocket() {
 }
 
 #[tokio::test]
-async fn test_404_for_unknown_routes() {
-    let (server, _temp_file) = create_test_server("# 404 Test").await;
+async fn test_unknown_routes_serve_spa() {
+    let (server, _temp_file) = create_test_server("# SPA Test").await;
 
+    // With embedded frontend, unknown routes serve the SPA for client-side routing
     let response = server.get("/unknown-route").await;
+    assert_eq!(response.status_code(), 200);
 
-    assert_eq!(response.status_code(), 404);
+    let html = response.text();
+    assert!(html.contains("<!doctype html>"), "Should serve SPA HTML");
 }
 
 #[tokio::test]
-async fn test_non_image_files_not_served() {
+async fn test_non_image_files_not_served_via_api() {
     use tempfile::tempdir;
 
     // Create a temporary directory
@@ -162,20 +165,28 @@ async fn test_non_image_files_not_served() {
         new_router(base_dir, tracked_files, is_directory_mode).expect("Failed to create router");
     let server = TestServer::new(router).expect("Failed to create test server");
 
-    // Test that non-image files return 404
+    // Test that non-image files return 404 via API static endpoint
+    let response = server.get("/api/static/secret.txt").await;
+    assert_eq!(response.status_code(), 404, "Secret files should not be accessible via API");
+
+    // Accessing non-API routes serves the SPA
     let response = server.get("/secret.txt").await;
-    assert_eq!(response.status_code(), 404);
+    assert_eq!(response.status_code(), 200, "Non-API routes serve the SPA");
+    assert!(response.text().contains("<!doctype html>"), "Should serve SPA HTML, not file content");
 }
 
 // Directory mode tests
 
 #[tokio::test]
-async fn test_directory_mode_file_not_found() {
+async fn test_directory_mode_non_api_routes_serve_spa() {
     let (server, _temp_dir) = create_directory_server().await;
 
-    // Test non-existent markdown file
+    // Non-API routes (even with .md extension) serve the SPA for client-side routing
     let response = server.get("/nonexistent.md").await;
-    assert_eq!(response.status_code(), 404);
+    assert_eq!(response.status_code(), 200, "Non-API routes serve the SPA");
+
+    let html = response.text();
+    assert!(html.contains("<!doctype html>"), "Should serve SPA HTML");
 }
 
 #[tokio::test]
@@ -241,13 +252,17 @@ async fn test_folder_based_routing_404_for_nonexistent_path() {
     let router = new_router(base_dir, tracked_files, true).expect("Failed to create router");
     let server = TestServer::new(router).expect("Failed to create test server");
 
-    // Test 404 for non-existent folder path
+    // Non-API routes serve the SPA, even for non-existent paths
     let response = server.get("/nonexistent/doc.md").await;
-    assert_eq!(response.status_code(), 404);
+    assert_eq!(response.status_code(), 200, "Non-API routes serve the SPA");
 
-    // Test 404 for non-existent file in existing folder
+    let html = response.text();
+    assert!(html.contains("<!doctype html>"), "Should serve SPA HTML");
+
+    // Same for non-existent files in existing folders
     let response = server.get("/folder1/nonexistent.md").await;
-    assert_eq!(response.status_code(), 404);
+    assert_eq!(response.status_code(), 200, "Non-API routes serve the SPA");
+    assert!(response.text().contains("<!doctype html>"), "Should serve SPA HTML");
 }
 
 // ===========================
@@ -487,4 +502,70 @@ async fn test_api_update_file_not_found() {
 
     let json = response.json::<serde_json::Value>();
     assert!(json["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn test_frontend_served_from_embedded_assets() {
+    let (server, _temp_dir) = create_directory_server().await;
+
+    // Test that the root path serves the frontend index.html
+    let response = server.get("/").await;
+    assert_eq!(response.status_code(), 200);
+
+    let html = response.text();
+    // Verify it's HTML and not an error message
+    assert!(html.contains("<!doctype html>"), "Should serve HTML, not an error");
+    assert!(html.contains("<div id=\"root\"></div>"), "Should contain React root element");
+    assert!(!html.contains("Frontend not built"), "Should not show 'Frontend not built' error");
+
+    // Verify the HTML references CSS and JS assets
+    assert!(html.contains(".css"), "Should reference CSS files");
+    assert!(html.contains(".js"), "Should reference JavaScript files");
+}
+
+#[tokio::test]
+async fn test_frontend_assets_accessible() {
+    let (server, _temp_dir) = create_directory_server().await;
+
+    // First get the index.html to find asset paths
+    let response = server.get("/").await;
+    let html = response.text();
+
+    // Extract a CSS file path from the HTML
+    // Looking for something like: href="/assets/index-ASLLX56R.css"
+    let css_start = html.find("href=\"/assets/").unwrap();
+    let css_path_start = css_start + 6; // Skip 'href="'
+    let css_end = html[css_path_start..].find("\"").unwrap();
+    let css_path = &html[css_path_start..css_path_start + css_end];
+
+    // Test that CSS asset is accessible
+    let css_response = server.get(css_path).await;
+    assert_eq!(css_response.status_code(), 200, "CSS asset should be accessible");
+    assert_eq!(css_response.header("content-type"), "text/css", "CSS should have correct MIME type");
+
+    // Extract a JS file path from the HTML
+    // Looking for something like: src="/assets/index-DUnTVOz5.js"
+    let js_start = html.find("src=\"/assets/").unwrap();
+    let js_path_start = js_start + 5; // Skip 'src="'
+    let js_end = html[js_path_start..].find("\"").unwrap();
+    let js_path = &html[js_path_start..js_path_start + js_end];
+
+    // Test that JS asset is accessible
+    let js_response = server.get(js_path).await;
+    assert_eq!(js_response.status_code(), 200, "JS asset should be accessible");
+    assert_eq!(js_response.header("content-type"), "text/javascript", "JS should have correct MIME type");
+}
+
+#[tokio::test]
+async fn test_frontend_spa_routing() {
+    let (server, _temp_dir) = create_directory_server().await;
+
+    // Test that unknown routes serve index.html for SPA routing
+    let response = server.get("/some/unknown/route").await;
+    assert_eq!(response.status_code(), 200);
+
+    let html = response.text();
+    // Should serve the same index.html for SPA client-side routing
+    assert!(html.contains("<!doctype html>"), "Unknown routes should serve HTML for SPA routing");
+    assert!(html.contains("<div id=\"root\"></div>"), "Should contain React root element");
 }

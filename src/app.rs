@@ -4,13 +4,14 @@ use axum::{
         ws::{Message, WebSocket},
         Path as AxumPath, State, WebSocketUpgrade,
     },
-    http::{header, StatusCode},
-    response::{IntoResponse, Json},
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Json, Response},
     routing::{get, put},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -23,10 +24,11 @@ use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, Mutex},
 };
-use tower_http::{
-    cors::CorsLayer,
-    services::{ServeDir, ServeFile},
-};
+use tower_http::cors::CorsLayer;
+
+#[derive(RustEmbed)]
+#[folder = "frontend/dist"]
+struct FrontendAssets;
 
 const RESCAN_DELAY_MS: u64 = 200;
 
@@ -469,6 +471,42 @@ async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
     }
 }
 
+async fn serve_embedded_file(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    // If path is empty or is a directory-like path, serve index.html
+    let file_path = if path.is_empty() || path.ends_with('/') {
+        "index.html"
+    } else {
+        path
+    };
+
+    match FrontendAssets::get(file_path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(content.data.into())
+                .unwrap()
+        }
+        None => {
+            // For SPA routing: if the file doesn't exist, serve index.html
+            match FrontendAssets::get("index.html") {
+                Some(content) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .body(content.data.into())
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body("404 Not Found".into())
+                    .unwrap(),
+            }
+        }
+    }
+}
+
 pub fn new_router(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
@@ -503,22 +541,7 @@ pub fn new_router(
         }
     });
 
-    // Create a separate router for serving the React app
-    let frontend_dist = PathBuf::from("frontend/dist");
-    let serve_frontend = if frontend_dist.exists() {
-        let index_path = frontend_dist.join("index.html");
-        if index_path.exists() {
-            Some(
-                ServeDir::new(frontend_dist.clone())
-                    .not_found_service(ServeFile::new(index_path)),
-            )
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
+    // Create router with embedded frontend assets
     let api_router = Router::new()
         .route("/api/files", get(api_get_files))
         .route("/api/files/*path", get(api_get_file))
@@ -526,15 +549,10 @@ pub fn new_router(
         .route("/api/static/*path", get(api_serve_static))
         .route("/ws", get(websocket_handler))
         .route("/__health", get(server_health))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .fallback(serve_embedded_file);
 
-    let router = if let Some(frontend_service) = serve_frontend {
-        api_router.fallback_service(frontend_service)
-    } else {
-        api_router.fallback(|| async { (StatusCode::NOT_FOUND, "Frontend not built") })
-    };
-
-    Ok(router.layer(CorsLayer::permissive()))
+    Ok(api_router.layer(CorsLayer::permissive()))
 }
 
 pub async fn serve_markdown(
@@ -638,6 +656,16 @@ async fn api_serve_static(
     AxumPath(path): AxumPath<String>,
     State(state): State<SharedMarkdownState>,
 ) -> impl IntoResponse {
+    // Only serve image files for security
+    if !is_image_file(&path) {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "File not found".to_string(),
+        )
+            .into_response();
+    }
+
     let state = state.lock().await;
 
     let full_path = state.base_dir.join(&path);

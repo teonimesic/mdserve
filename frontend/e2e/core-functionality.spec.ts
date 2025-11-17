@@ -467,3 +467,52 @@ test('should track renamed file after edit and rename', async ({ page }) => {
   // Verify URL reflects the new filename
   expect(page.url()).toContain('renamed-test.md')
 })
+
+test('should handle relative links in nested markdown files', async ({ page }) => {
+  // Create a root level file
+  writeFileSync(join(testDir, 'root-file.md'), '# Root File\n\nThis is at the root.')
+
+  // Create a subfolder with a file that links to the root file
+  mkdirSync(join(testDir, 'subfolder'))
+  writeFileSync(
+    join(testDir, 'subfolder', 'nested-file.md'),
+    '# Nested File\n\n[Link to root file](../root-file.md)'
+  )
+
+  await page.goto(SERVER_URL)
+  await page.waitForSelector('.file-list')
+
+  // Wait for files to appear
+  await page.waitForTimeout(2000)
+
+  // Navigate to the subfolder
+  const folder = page.getByText('subfolder', { exact: true })
+  await folder.click()
+
+  // Click on the nested file
+  const nestedFile = page.getByText('nested-file.md')
+  await nestedFile.click()
+
+  await page.waitForSelector('h1')
+
+  // Verify we're viewing the nested file
+  let heading = page.getByRole('heading', { name: 'Nested File' })
+  await expect(heading).toBeVisible()
+
+  // Click the relative link
+  const link = page.getByRole('link', { name: 'Link to root file' })
+  await link.click()
+
+  // Wait for navigation
+  await page.waitForSelector('h1')
+
+  // Verify we navigated to the root file
+  heading = page.getByRole('heading', { name: 'Root File' })
+  await expect(heading).toBeVisible()
+
+  const content = page.getByText('This is at the root.')
+  await expect(content).toBeVisible()
+
+  // Verify the URL reflects the correct file
+  expect(page.url()).toContain('root-file.md')
+})
