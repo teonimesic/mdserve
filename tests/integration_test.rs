@@ -1,5 +1,5 @@
 use axum_test::TestServer;
-use mdserve::{new_router, scan_markdown_files, ServerMessage};
+use mdserve::{new_router, scan_markdown_files, ClientMessage, ServerMessage};
 use std::fs;
 use std::time::Duration;
 use tempfile::{tempdir, Builder, NamedTempFile, TempDir};
@@ -568,4 +568,334 @@ async fn test_frontend_spa_routing() {
     // Should serve the same index.html for SPA client-side routing
     assert!(html.contains("<!doctype html>"), "Unknown routes should serve HTML for SPA routing");
     assert!(html.contains("<div id=\"root\"></div>"), "Should contain React root element");
+}
+
+// ============================================================================
+// Health Endpoint Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_health_endpoint() {
+    let (server, _temp_dir) = create_directory_server().await;
+
+    let response = server.get("/__health").await;
+
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.text(), "ready");
+}
+
+// ============================================================================
+// API Static File Serving Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_api_static_serves_image_successfully() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    // Create a test markdown file
+    fs::write(temp_dir.path().join("test.md"), "# Test").expect("Failed to write markdown");
+
+    // Create a test image file (simple PNG header)
+    let png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic bytes
+    fs::write(temp_dir.path().join("test.png"), &png_bytes).expect("Failed to write image");
+
+    let base_dir = temp_dir.path().to_path_buf();
+    let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan");
+    let router = new_router(base_dir, tracked_files, true).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create server");
+
+    // Test that image is served successfully
+    let response = server.get("/api/static/test.png").await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.header("content-type"), "image/png");
+    assert_eq!(response.as_bytes(), &png_bytes);
+}
+
+#[tokio::test]
+async fn test_api_static_path_traversal_blocked() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    // Create a markdown file in the temp dir
+    fs::write(temp_dir.path().join("test.md"), "# Test").expect("Failed to write markdown");
+
+    // Create a "secret" file outside the base directory (in parent)
+    let parent_dir = temp_dir.path().parent().unwrap();
+    let secret_file = parent_dir.join("secret_image.png");
+    fs::write(&secret_file, "SECRET DATA").expect("Failed to write secret file");
+
+    // Create a symlink inside base_dir that points to the secret file outside
+    let symlink_path = temp_dir.path().join("link_to_secret.png");
+    symlink(&secret_file, &symlink_path).expect("Failed to create symlink");
+
+    let base_dir = temp_dir.path().to_path_buf();
+    let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan");
+    let router = new_router(base_dir, tracked_files, true).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create server");
+
+    // Try to access file outside base directory via symlink
+    let response = server.get("/api/static/link_to_secret.png").await;
+    assert_eq!(response.status_code(), 403, "Symlink to file outside base dir should be blocked with 403 Forbidden");
+    assert_eq!(response.text(), "Access denied");
+
+    // Cleanup
+    fs::remove_file(&symlink_path).ok();
+    fs::remove_file(&secret_file).ok();
+}
+
+#[tokio::test]
+async fn test_api_static_nonexistent_image_returns_404() {
+    let (server, _temp_dir) = create_directory_server().await;
+
+    // Request a non-existent image file
+    let response = server.get("/api/static/nonexistent.png").await;
+    assert_eq!(response.status_code(), 404);
+    assert_eq!(response.text(), "File not found");
+}
+
+#[tokio::test]
+async fn test_api_static_supports_multiple_image_formats() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    fs::write(temp_dir.path().join("test.md"), "# Test").expect("Failed to write markdown");
+
+    // Create test images for different formats
+    fs::write(temp_dir.path().join("test.jpg"), "JPEG data").expect("Failed to write jpg");
+    fs::write(temp_dir.path().join("test.gif"), "GIF data").expect("Failed to write gif");
+    fs::write(temp_dir.path().join("test.svg"), "SVG data").expect("Failed to write svg");
+    fs::write(temp_dir.path().join("test.webp"), "WEBP data").expect("Failed to write webp");
+
+    let base_dir = temp_dir.path().to_path_buf();
+    let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan");
+    let router = new_router(base_dir, tracked_files, true).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create server");
+
+    // Test JPG
+    let response = server.get("/api/static/test.jpg").await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.header("content-type"), "image/jpeg");
+
+    // Test GIF
+    let response = server.get("/api/static/test.gif").await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.header("content-type"), "image/gif");
+
+    // Test SVG
+    let response = server.get("/api/static/test.svg").await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.header("content-type"), "image/svg+xml");
+
+    // Test WebP
+    let response = server.get("/api/static/test.webp").await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.header("content-type"), "image/webp");
+}
+
+// ============================================================================
+// WebSocket Message Type Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_websocket_ping_message() {
+    let (server, _temp_file) = create_test_server_with_http("# Test").await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Send Ping message
+    let ping_msg = serde_json::to_string(&ClientMessage::Ping).unwrap();
+    websocket.send_text(ping_msg).await;
+
+    // Connection should remain open - verify by sending another message
+    // If the ping caused an error, this would fail
+    let ping_msg2 = serde_json::to_string(&ClientMessage::Ping).unwrap();
+    websocket.send_text(ping_msg2).await;
+
+    // Success - Ping messages are handled without error
+}
+
+#[tokio::test]
+async fn test_websocket_request_refresh_message() {
+    let (server, _temp_file) = create_test_server_with_http("# Test").await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Send RequestRefresh message
+    let refresh_msg = serde_json::to_string(&ClientMessage::RequestRefresh).unwrap();
+    websocket.send_text(refresh_msg).await;
+
+    // Connection should remain open
+    let ping_msg = serde_json::to_string(&ClientMessage::Ping).unwrap();
+    websocket.send_text(ping_msg).await;
+
+    // Success - RequestRefresh messages are handled without error
+}
+
+#[tokio::test]
+async fn test_websocket_close_message() {
+    let (server, _temp_file) = create_test_server_with_http("# Test").await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Send Close message
+    websocket.close().await;
+
+    // Wait a moment for the close to process
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connection should be closed - attempting to receive should indicate closure
+    // The websocket library should handle this gracefully
+}
+
+#[tokio::test]
+async fn test_websocket_invalid_json() {
+    let (server, _temp_file) = create_test_server_with_http("# Test").await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Send invalid JSON
+    websocket.send_text("{invalid json}").await;
+
+    // Connection should remain open despite invalid JSON
+    // Verify by sending a valid message
+    let ping_msg = serde_json::to_string(&ClientMessage::Ping).unwrap();
+    websocket.send_text(ping_msg).await;
+
+    // Success - invalid JSON doesn't crash the connection
+}
+
+// ============================================================================
+// File Event Handler Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_image_file_modification_triggers_reload() {
+    let (server, temp_dir) = create_directory_server_with_http().await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Create an image file
+    let image_path = temp_dir.path().join("test-image.png");
+    fs::write(&image_path, vec![0x89, 0x50, 0x4E, 0x47]).expect("Failed to write image");
+
+    // Wait for file system event to be processed
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Modify the image file
+    fs::write(&image_path, vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]).expect("Failed to modify image");
+
+    // Should receive Reload message via WebSocket
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
+        websocket.receive_json::<ServerMessage>(),
+    )
+    .await;
+
+    match update_result {
+        Ok(message) => {
+            assert_eq!(message, ServerMessage::Reload, "Expected Reload message after image modification");
+        }
+        Err(_) => {
+            panic!("Timeout waiting for reload after image modification");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_new_markdown_file_triggers_file_added() {
+    let (server, temp_dir) = create_directory_server_with_http().await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Wait a moment for initial setup
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Create a new markdown file
+    let new_file_path = temp_dir.path().join("new-file.md");
+    fs::write(&new_file_path, "# New File").expect("Failed to create new file");
+
+    // Should receive FileAdded message via WebSocket
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
+        websocket.receive_json::<ServerMessage>(),
+    )
+    .await;
+
+    match update_result {
+        Ok(message) => {
+            match message {
+                ServerMessage::FileAdded { name } => {
+                    assert_eq!(name, "new-file.md", "Expected new-file.md to be added");
+                }
+                _ => panic!("Expected FileAdded message, got {:?}", message),
+            }
+        }
+        Err(_) => {
+            panic!("Timeout waiting for FileAdded after creating new markdown file");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_markdown_file_removal_triggers_file_removed() {
+    let (server, temp_dir) = create_directory_server_with_http().await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Wait a moment for initial setup
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Remove one of the existing test files
+    let file_to_remove = temp_dir.path().join("test1.md");
+    fs::remove_file(&file_to_remove).expect("Failed to remove file");
+
+    // Should receive FileRemoved message via WebSocket (after delayed rescan)
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
+        websocket.receive_json::<ServerMessage>(),
+    )
+    .await;
+
+    match update_result {
+        Ok(message) => {
+            match message {
+                ServerMessage::FileRemoved { name } => {
+                    assert_eq!(name, "test1.md", "Expected test1.md to be removed");
+                }
+                _ => panic!("Expected FileRemoved message, got {:?}", message),
+            }
+        }
+        Err(_) => {
+            panic!("Timeout waiting for FileRemoved after deleting markdown file");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_file_rename_triggers_file_renamed() {
+    let (server, temp_dir) = create_directory_server_with_http().await;
+    let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+
+    // Wait a moment for initial setup
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Rename one of the existing test files
+    let old_path = temp_dir.path().join("test1.md");
+    let new_path = temp_dir.path().join("renamed-test.md");
+    fs::rename(&old_path, &new_path).expect("Failed to rename file");
+
+    // Should receive FileRenamed message via WebSocket
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
+        websocket.receive_json::<ServerMessage>(),
+    )
+    .await;
+
+    match update_result {
+        Ok(message) => {
+            match message {
+                ServerMessage::FileRenamed { old_name, new_name } => {
+                    assert_eq!(old_name, "test1.md", "Expected old name to be test1.md");
+                    assert_eq!(new_name, "renamed-test.md", "Expected new name to be renamed-test.md");
+                }
+                _ => panic!("Expected FileRenamed message, got {:?}", message),
+            }
+        }
+        Err(_) => {
+            panic!("Timeout waiting for FileRenamed after renaming file");
+        }
+    }
 }
